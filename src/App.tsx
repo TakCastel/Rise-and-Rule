@@ -5,7 +5,14 @@ import { formatDate } from "./game/tick";
 import { findKingdomTitle, realmDisplayName } from "./game/titles";
 import type { GameSpeed } from "./game/types";
 import { MapView } from "./map/MapView";
-import { TERRAIN_PALETTE, developmentColor, opinionColor } from "./map/levels";
+import {
+  ALLIANCE_ALLY_COLOR,
+  ALLIANCE_NEUTRAL_COLOR,
+  ALLIANCE_SELF_COLOR,
+  TERRAIN_PALETTE,
+  developmentColor,
+  opinionColor,
+} from "./map/levels";
 import type { LevelName, Selection, TerrainType, WorldData } from "./types/world";
 import { GameMenu } from "./ui/GameMenu";
 import { ActionAlerts } from "./ui/ActionAlerts";
@@ -227,6 +234,21 @@ function App() {
           label: b.label,
           color: opinionColor(b.score),
         }))
+      : [];
+
+  const allianceLegendTitle =
+    opinionFocusName &&
+    (canPlayAs ||
+      (game?.playerId != null && opinionFocusId !== game.playerId))
+      ? `Alliances of ${opinionFocusName}`
+      : "Your alliances";
+  const allianceLegend =
+    showLegend && level === "alliance"
+      ? [
+          { label: "Selected", color: ALLIANCE_SELF_COLOR },
+          { label: "Ally", color: ALLIANCE_ALLY_COLOR },
+          { label: "Not allied", color: ALLIANCE_NEUTRAL_COLOR },
+        ]
       : [];
 
   return (
@@ -475,6 +497,17 @@ function App() {
             <div id="terrain-legend-overlay">
               <div className="legend-title">{opinionLegendTitle}</div>
               {opinionLegend.map((row) => (
+                <div key={row.label} className="legend-row">
+                  <span className="swatch" style={{ background: row.color }} />
+                  <span>{row.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {allianceLegend.length > 0 && (
+            <div id="terrain-legend-overlay">
+              <div className="legend-title">{allianceLegendTitle}</div>
+              {allianceLegend.map((row) => (
                 <div key={row.label} className="legend-row">
                   <span className="swatch" style={{ background: row.color }} />
                   <span>{row.label}</span>
