@@ -7,6 +7,8 @@ import type { GameSpeed } from "./game/types";
 import { MapView } from "./map/MapView";
 import {
   ALLIANCE_ALLY_COLOR,
+  ALLIANCE_ENEMY_ALLY_COLOR,
+  ALLIANCE_ENEMY_COLOR,
   ALLIANCE_NEUTRAL_COLOR,
   ALLIANCE_SELF_COLOR,
   TERRAIN_PALETTE,
@@ -239,11 +241,23 @@ function App() {
   const allianceLegendTitle = opinionFocusName
     ? `Alliances of ${opinionFocusName}`
     : "Alliances of you";
+  const allianceAtWar =
+    !selection &&
+    game?.playerId != null &&
+    (game.wars || []).some(
+      (w) => w.attackerId === game.playerId || w.defenderId === game.playerId,
+    );
   const allianceLegend =
     showLegend && level === "alliance"
       ? [
           { label: opinionFocusName ?? "You", color: ALLIANCE_SELF_COLOR },
           { label: "Ally", color: ALLIANCE_ALLY_COLOR },
+          ...(allianceAtWar
+            ? [
+                { label: "At war with you", color: ALLIANCE_ENEMY_COLOR },
+                { label: "Enemy's ally", color: ALLIANCE_ENEMY_ALLY_COLOR },
+              ]
+            : []),
           { label: "Other", color: ALLIANCE_NEUTRAL_COLOR },
         ]
       : [];

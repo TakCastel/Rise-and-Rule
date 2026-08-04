@@ -345,6 +345,10 @@ export function MapView({
       opinions,
       titles,
       alliances,
+      // Vue par défaut (aucune sélection) uniquement : le focus est alors le
+      // joueur lui-même, donc ses ennemis de guerre s'affichent aussi.
+      // Dès qu'on clique un pays, seuls lui et ses alliés restent affichés.
+      allianceEnemyIds: !selection ? warEnemyIds : undefined,
     });
   }, [
     world,

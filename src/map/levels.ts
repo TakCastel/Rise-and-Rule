@@ -852,6 +852,7 @@ export function getUnits(
     opinions?: Record<string, number>;
     titles?: Title[];
     alliances?: Alliance[];
+    allianceEnemyIds?: number[];
   },
 ): RenderUnit[] {
   if (level === "royaume") return getKingdomUnits(world);
@@ -863,7 +864,7 @@ export function getUnits(
     return getOpinionUnits(world, opts?.playerId, opts?.opinions, opts?.titles);
   }
   if (level === "alliance") {
-    return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles);
+    return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles, opts?.allianceEnemyIds);
   }
   return getDomainUnits(world);
 }
@@ -1054,24 +1055,39 @@ export const ALLIANCE_NEUTRAL_COLOR = "#8a8172";
 export const ALLIANCE_SELF_COLOR = "#c4a35a";
 /** Vue Alliances — allié du focus. */
 export const ALLIANCE_ALLY_COLOR = "#3f9d52";
+/** Vue Alliances — en guerre contre le focus (vue par défaut, sans sélection). */
+export const ALLIANCE_ENEMY_COLOR = "#b3392b";
+/** Vue Alliances — allié d’un ennemi du focus (vue par défaut, sans sélection). */
+export const ALLIANCE_ENEMY_ALLY_COLOR = "#c97b3d";
 
 /**
  * Vue Alliances : possessions colorées selon leur relation au focus
  * (personnage cliqué / survolé, ou le joueur en partie) — le focus en doré,
  * ses alliés directs en vert, le reste en gris neutre. Même logique que la
  * vue Opinion, appliquée aux alliances.
+ *
+ * `enemyIds` (optionnel, vue par défaut sans sélection uniquement) met en
+ * évidence les puissances actuellement en guerre contre le focus (rouge) et
+ * leurs propres alliés (orange) — pour repérer qui risque de venir prêter
+ * main-forte à l’ennemi.
  */
 export function getAllianceUnits(
   world: WorldData,
   alliances: Alliance[] | undefined,
   playerId: number | null | undefined,
   titles?: Title[],
+  enemyIds?: number[],
 ): RenderUnit[] {
   const list = (world.possessions || []).filter(
     (p) => p.rank === "king" || p.rank === "chief",
   );
 
   const allyIds = playerId != null ? new Set(getAllyIds(alliances, playerId)) : null;
+  const enemyIdSet = new Set(enemyIds || []);
+  const enemyAllyIds = new Set<number>();
+  for (const eid of enemyIdSet) {
+    for (const aid of getAllyIds(alliances, eid)) enemyAllyIds.add(aid);
+  }
 
   const heldIds = new Set<number>();
   const units = list
@@ -1098,11 +1114,17 @@ export function getAllianceUnits(
 
       const isSelf = playerId != null && p.id === playerId;
       const isAlly = !isSelf && !!allyIds?.has(p.id);
+      const isEnemy = !isSelf && !isAlly && enemyIdSet.has(p.id);
+      const isEnemyAlly = !isSelf && !isAlly && !isEnemy && enemyAllyIds.has(p.id);
       const color = isSelf
         ? ALLIANCE_SELF_COLOR
         : isAlly
           ? ALLIANCE_ALLY_COLOR
-          : ALLIANCE_NEUTRAL_COLOR;
+          : isEnemy
+            ? ALLIANCE_ENEMY_COLOR
+            : isEnemyAlly
+              ? ALLIANCE_ENEMY_ALLY_COLOR
+              : ALLIANCE_NEUTRAL_COLOR;
       const u = toRender(
         {
           id: p.id,
@@ -1388,6 +1410,7 @@ export function getRenderUnits(
     opinions?: Record<string, number>;
     titles?: Title[];
     alliances?: Alliance[];
+    allianceEnemyIds?: number[];
   },
 ): RenderUnit[] {
   // Domaine sélectionné hors vue Domain/Terrain/Economy → garder le maillage du parent
@@ -1399,7 +1422,7 @@ export function getRenderUnits(
       return getOpinionUnits(world, opts?.playerId, opts?.opinions, opts?.titles);
     }
     if (level === "alliance") {
-      return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles);
+      return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles, opts?.allianceEnemyIds);
     }
     if (level === "domaine") return getUnits(world, "domaine");
 
@@ -1514,7 +1537,7 @@ export function getRenderUnits(
     return getOpinionUnits(world, opts?.playerId, opts?.opinions, opts?.titles);
   }
   if (level === "alliance") {
-    return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles);
+    return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles, opts?.allianceEnemyIds);
   }
 
   const base = getUnits(world, level, opts);
