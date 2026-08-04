@@ -1,3 +1,4 @@
+import { getAllyIds } from "../game/alliance";
 import { domainMonthlyIncome } from "../game/economy";
 import { getOpinion } from "../game/opinion";
 import { controlsDomain, realmDisplayName, type Title } from "../game/titles";
@@ -1047,26 +1048,18 @@ export function getOpinionUnits(
   return [...units, ...solos];
 }
 
-/** Vue Alliances — aucune alliance (indépendant). */
+/** Vue Alliances — pouvoir sans lien avec le focus. */
 export const ALLIANCE_NEUTRAL_COLOR = "#8a8172";
+/** Vue Alliances — le focus (personnage cliqué / survolé, ou le joueur en partie). */
+export const ALLIANCE_SELF_COLOR = "#c4a35a";
+/** Vue Alliances — allié du focus. */
+export const ALLIANCE_ALLY_COLOR = "#3f9d52";
 
 /**
- * Couleur d’un bloc allié — angle doré (137.508°) pour un maximum de
- * distinction visuelle entre blocs consécutifs, quel que soit leur nombre.
- */
-function allianceClusterColor(index: number): string {
-  const hue = (index * 137.508) % 360;
-  const sat = 0.6;
-  const light = index % 2 === 0 ? 0.5 : 0.38;
-  return toHex(...hslToRgb(hue, sat, light));
-}
-
-/**
- * Vue Alliances : chaque roi/chef indépendant coloré selon son bloc
- * d’alliances (composantes connexes du graphe des alliances, y compris
- * transitives — A allié à B allié à C forment un seul bloc/couleur) — pour
- * repérer d’un coup d’œil qui est avec qui. Un pouvoir sans aucune alliance
- * reste en gris neutre.
+ * Vue Alliances : possessions colorées selon leur relation au focus
+ * (personnage cliqué / survolé, ou le joueur en partie) — le focus en doré,
+ * ses alliés directs en vert, le reste en gris neutre. Même logique que la
+ * vue Opinion, appliquée aux alliances.
  */
 export function getAllianceUnits(
   world: WorldData,
@@ -1077,36 +1070,8 @@ export function getAllianceUnits(
   const list = (world.possessions || []).filter(
     (p) => p.rank === "king" || p.rank === "chief",
   );
-  const idSet = new Set(list.map((p) => p.id));
 
-  const parent = new Map<number, number>();
-  function find(id: number): number {
-    let root = id;
-    while (parent.get(root) !== root) root = parent.get(root)!;
-    return root;
-  }
-  function union(a: number, b: number) {
-    if (!parent.has(a)) parent.set(a, a);
-    if (!parent.has(b)) parent.set(b, b);
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent.set(ra, rb);
-  }
-  for (const a of alliances || []) {
-    if (idSet.has(a.aId) && idSet.has(a.bId)) union(a.aId, a.bId);
-  }
-
-  const clusterMembers = new Map<number, number[]>();
-  for (const p of list) {
-    if (!parent.has(p.id)) continue;
-    const root = find(p.id);
-    const arr = clusterMembers.get(root) ?? [];
-    arr.push(p.id);
-    clusterMembers.set(root, arr);
-  }
-  const roots = [...clusterMembers.keys()].sort((a, b) => a - b);
-  const colorOf = new Map<number, string>();
-  roots.forEach((root, i) => colorOf.set(root, allianceClusterColor(i)));
+  const allyIds = playerId != null ? new Set(getAllyIds(alliances, playerId)) : null;
 
   const heldIds = new Set<number>();
   const units = list
@@ -1132,10 +1097,12 @@ export function getAllianceUnits(
       }
 
       const isSelf = playerId != null && p.id === playerId;
-      const root = parent.has(p.id) ? find(p.id) : null;
-      const blocSize = root != null ? (clusterMembers.get(root)?.length ?? 0) : 0;
-      const color =
-        root != null && blocSize >= 2 ? colorOf.get(root)! : ALLIANCE_NEUTRAL_COLOR;
+      const isAlly = !isSelf && !!allyIds?.has(p.id);
+      const color = isSelf
+        ? ALLIANCE_SELF_COLOR
+        : isAlly
+          ? ALLIANCE_ALLY_COLOR
+          : ALLIANCE_NEUTRAL_COLOR;
       const u = toRender(
         {
           id: p.id,
