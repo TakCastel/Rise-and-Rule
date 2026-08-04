@@ -262,39 +262,6 @@ function parsePk(k) {
   return [Number(k.slice(0, i)), Number(k.slice(i + 1))];
 }
 
-/** Densifie une fois (Chaikin) puis lisse sans exploser le nombre de points. */
-function chaikinOpenOnce(pts) {
-  if (pts.length < 2) return pts.map((q) => [q[0], q[1]]);
-  const out = [pts[0]];
-  for (let i = 0; i < pts.length - 1; i++) {
-    const [x0, y0] = pts[i];
-    const [x1, y1] = pts[i + 1];
-    out.push([0.75 * x0 + 0.25 * x1, 0.75 * y0 + 0.25 * y1]);
-    out.push([0.25 * x0 + 0.75 * x1, 0.25 * y0 + 0.75 * y1]);
-  }
-  out.push(pts[pts.length - 1]);
-  return out;
-}
-
-/** Moyenne glissante extrémités figées — casse les marches d’escalier. */
-function smoothOpenFixedEnds(pts, passes) {
-  let p = pts.map((q) => [q[0], q[1]]);
-  for (let pass = 0; pass < passes; pass++) {
-    if (p.length < 3) break;
-    const out = new Array(p.length);
-    out[0] = p[0];
-    out[p.length - 1] = p[p.length - 1];
-    for (let i = 1; i < p.length - 1; i++) {
-      out[i] = [
-        0.22 * p[i - 1][0] + 0.56 * p[i][0] + 0.22 * p[i + 1][0],
-        0.22 * p[i - 1][1] + 0.56 * p[i][1] + 0.22 * p[i + 1][1],
-      ];
-    }
-    p = out;
-  }
-  return p;
-}
-
 function smoothClosed(pts, passes) {
   let p = pts.map((q) => [q[0], q[1]]);
   for (let pass = 0; pass < passes; pass++) {
@@ -310,12 +277,6 @@ function smoothClosed(pts, passes) {
     p = out;
   }
   return p;
-}
-
-function polishOpen(pts, passes) {
-  // 1 densification + lissage court — 2× Chaikin créait des filaments
-  let p = chaikinOpenOnce(pts);
-  return smoothOpenFixedEnds(p, passes);
 }
 
 function polishClosed(pts, passes) {
@@ -412,152 +373,6 @@ function laplacianShared(domains, iterations = 12, lambda = 0.55, pinned = null)
       }
     }
   }
-}
-
-/**
- * Lisse les frontières sans trous : densify léger + lissage fort + laplacien.
- * Les jonctions (degré ≠ 2) restent fixes.
- */
-function smoothSharedBoundaries(domains, passes = 28) {
-  const adj = new Map();
-  const addAdj = (a, b) => {
-    if (a === b) return;
-    if (!adj.has(a)) adj.set(a, new Set());
-    if (!adj.has(b)) adj.set(b, new Set());
-    adj.get(a).add(b);
-    adj.get(b).add(a);
-  };
-
-  const ringKeysList = []; // {di, ri, keys}
-  for (let di = 0; di < domains.length; di++) {
-    const d = domains[di];
-    for (let ri = 0; ri < d.rings.length; ri++) {
-      const keys = openRing(d.rings[ri]).map(pk);
-      if (keys.length < 3) continue;
-      ringKeysList.push({ di, ri, keys });
-      for (let i = 0; i < keys.length; i++) {
-        addAdj(keys[i], keys[(i + 1) % keys.length]);
-      }
-    }
-  }
-  if (!adj.size) return;
-
-  const degree = (k) => adj.get(k)?.size ?? 0;
-  const isJunction = (k) => degree(k) !== 2;
-
-  const segKey = (a, b) => (a < b ? `${a}\t${b}` : `${b}\t${a}`);
-  const visited = new Set();
-  /** @type {Map<string, [number, number][]>} */
-  const chainFwd = new Map(); // "a→b" -> smoothed points including ends
-
-  const storeChain = (keyPath, closed) => {
-    const pts = keyPath.map(parsePk);
-    const smooth = closed ? polishClosed(pts, passes) : polishOpen(pts, passes);
-    const a = keyPath[0];
-    const b = keyPath[keyPath.length - 1];
-    chainFwd.set(`${a}→${b}`, smooth);
-    if (!closed && a !== b) {
-      chainFwd.set(`${b}→${a}`, [...smooth].reverse());
-    }
-    if (closed) {
-      chainFwd.set(`${a}→${a}`, smooth);
-    }
-  };
-
-  // Chaînes entre jonctions
-  for (const [start, nbs] of adj) {
-    if (!isJunction(start)) continue;
-    for (const first of nbs) {
-      const sk0 = segKey(start, first);
-      if (visited.has(sk0)) continue;
-      const path = [start];
-      let prev = start;
-      let cur = first;
-      visited.add(sk0);
-      path.push(cur);
-      while (!isJunction(cur)) {
-        const nexts = [...adj.get(cur)].filter((x) => x !== prev);
-        if (!nexts.length) break;
-        const next = nexts[0];
-        visited.add(segKey(cur, next));
-        path.push(next);
-        prev = cur;
-        cur = next;
-      }
-      if (path.length >= 2) storeChain(path, false);
-    }
-  }
-
-  // Boucles sans jonction
-  for (const [start, nbs] of adj) {
-    for (const first of nbs) {
-      const sk0 = segKey(start, first);
-      if (visited.has(sk0)) continue;
-      const path = [start];
-      let prev = start;
-      let cur = first;
-      visited.add(sk0);
-      for (;;) {
-        const nexts = [...adj.get(cur)].filter((x) => x !== prev);
-        if (!nexts.length) break;
-        const next = nexts[0];
-        const sk = segKey(cur, next);
-        if (next === start) {
-          visited.add(sk);
-          break;
-        }
-        if (visited.has(sk)) break;
-        visited.add(sk);
-        path.push(next);
-        prev = cur;
-        cur = next;
-        if (path.length > adj.size + 2) break;
-      }
-      if (path.length >= 3) storeChain(path, true);
-    }
-  }
-
-  // Reconstruire chaque anneau
-  for (const { di, ri, keys } of ringKeysList) {
-    const n = keys.length;
-    const junctIdx = [];
-    for (let i = 0; i < n; i++) {
-      if (isJunction(keys[i])) junctIdx.push(i);
-    }
-
-    let out = [];
-    if (junctIdx.length === 0) {
-      // Boucle entière
-      const smooth = chainFwd.get(`${keys[0]}→${keys[0]}`);
-      out = smooth ? smooth.map((p) => [p[0], p[1]]) : keys.map(parsePk);
-    } else {
-      for (let j = 0; j < junctIdx.length; j++) {
-        const i0 = junctIdx[j];
-        const i1 = junctIdx[(j + 1) % junctIdx.length];
-        const a = keys[i0];
-        const b = keys[i1];
-        let smooth = chainFwd.get(`${a}→${b}`);
-        if (!smooth) {
-          // Fallback : points bruts le long de l’anneau
-          const raw = [];
-          let i = i0;
-          for (;;) {
-            raw.push(parsePk(keys[i]));
-            if (i === i1 && raw.length > 1) break;
-            i = (i + 1) % n;
-            if (raw.length > n + 2) break;
-          }
-          smooth = raw;
-        }
-        if (j === 0) out.push(...smooth.map((p) => [p[0], p[1]]));
-        else out.push(...smooth.slice(1).map((p) => [p[0], p[1]]));
-      }
-    }
-    if (out.length >= 3) domains[di].rings[ri] = closeRing(out);
-  }
-
-  // 2ᵉ passe : laplacien partagé léger (trop fort → spikes / auto-intersections)
-  laplacianShared(domains, 6, 0.35);
 }
 
 export function buildImpassable(elevAt, landMask, bbox, onLand) {
