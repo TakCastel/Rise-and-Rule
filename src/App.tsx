@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { FolderOpen, Pause, Pencil, Play, RotateCcw, Save } from "lucide-react";
+import { FolderOpen, Monitor, Pause, Pencil, Play, RotateCcw, Save } from "lucide-react";
 import { useGame } from "./game/useGame";
 import { formatDate } from "./game/tick";
 import { findKingdomTitle, realmDisplayName } from "./game/titles";
@@ -29,6 +29,7 @@ import { WarIcon } from "./ui/WarIcon";
 import { WarPanel } from "./ui/WarPanel";
 import { NoticeModal } from "./ui/NoticeModal";
 import { AllegianceDemandModal } from "./ui/AllegianceDemandModal";
+import { BuyMeACoffeeButton } from "./ui/BuyMeACoffeeButton";
 import { NoticeToastStack } from "./ui/NoticeToastStack";
 import { cn, withBase } from "@/lib/utils";
 import "./App.css";
@@ -315,7 +316,16 @@ function App() {
       : [];
 
   return (
-    <div id="app-layout">
+    <>
+      {/* Toujours dans le DOM, affiché uniquement sous le seuil CSS
+          (`#mobile-block`/`#app-layout` display, cf. App.css) — réagit au
+          resize/à la rotation d'écran, pas juste à la largeur au montage. */}
+      <div id="mobile-block">
+        <Monitor size={32} strokeWidth={1.5} aria-hidden />
+        <h1>Desktop only</h1>
+        <p>Rise and Rule is a browser game built for a mouse and a big map — it doesn't work on a phone or tablet. Come back on a computer.</p>
+      </div>
+      <div id="app-layout">
       <header id="app-header">
         <div className="header-left">
           {(inPlay || isGameOver) && player && game && (
@@ -802,7 +812,9 @@ function App() {
             onRespond={(requestId, accept) => doRespondAllegianceDemand(requestId, accept)}
           />
         )}
-    </div>
+      <BuyMeACoffeeButton />
+      </div>
+    </>
   );
 }
 

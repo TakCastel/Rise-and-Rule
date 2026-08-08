@@ -6,6 +6,102 @@
   color: hsl(var(--foreground));
 }
 
+/**
+ * Jeu desktop uniquement — la carte a besoin d'un vrai espace d'écran et
+ * d'une souris (pan/zoom/hover), aucune adaptation tactile/petit écran
+ * n'existe ailleurs dans ce CSS. Sous le seuil, on masque l'app entière et on
+ * montre ce message à la place plutôt que de laisser une UI cassée/inutilisable.
+ * `#mobile-block` reste toujours dans le DOM (cf. App.tsx) — c'est ce media
+ * query, pas React, qui décide lequel des deux s'affiche ; il réagit donc
+ * aussi à une rotation d'écran ou un redimensionnement de fenêtre, pas
+ * seulement à la largeur au premier rendu.
+ */
+#mobile-block {
+  display: none;
+}
+
+@media (max-width: 860px) {
+  #app-layout {
+    display: none;
+  }
+
+  #mobile-block {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    padding: 2rem;
+    text-align: center;
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+  }
+
+  #mobile-block svg {
+    color: hsl(var(--muted-foreground));
+    margin-bottom: 0.25rem;
+  }
+
+  #mobile-block h1 {
+    margin: 0;
+    font-size: 1.15rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
+  #mobile-block p {
+    margin: 0;
+    max-width: 26rem;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    color: hsl(var(--muted-foreground));
+  }
+}
+
+/**
+ * Ancré au viewport (pas à `.map2d`, dont le coin bas-droit sert déjà au
+ * sélecteur de niveau / à l'icône de guerre) — visible sur tous les écrans
+ * (menu, choix de perso, partie), toujours par-dessus le contenu mais sous
+ * les modales (`.notice-modal-overlay`, z-index 100).
+ */
+.bmac-button {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 50;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--background) / 0.85);
+  color: hsl(var(--muted-foreground));
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-decoration: none;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 2px 10px hsl(0 0% 0% / 0.25);
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease,
+    background 0.15s ease,
+    transform 0.15s ease;
+}
+
+.bmac-button:hover {
+  color: hsl(45 93% 58%);
+  border-color: hsl(45 93% 58% / 0.6);
+  background: hsl(var(--background));
+  transform: translateY(-1px);
+}
+
+.bmac-button svg {
+  flex-shrink: 0;
+  color: hsl(45 93% 58%);
+}
+
 #app-header {
   display: flex;
   align-items: center;
