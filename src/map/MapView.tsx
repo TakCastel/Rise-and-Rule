@@ -158,15 +158,25 @@ function armyGlyphParts(
   return { lines: [], dots: [] };
 }
 
-/** Triangle plein pointant selon `angle` (radians), pointe en (x, y). */
-function arrowHeadPath(x: number, y: number, angle: number, size: number): string {
+/** Sommets du triangle de tête de flèche pointant selon `angle` (radians), pointe en (x, y). */
+function arrowHeadPoints(x: number, y: number, angle: number, size: number): [number, number][] {
   const spread = 0.5;
   const back = angle + Math.PI;
   const x1 = x + Math.cos(back + spread) * size;
   const y1 = y + Math.sin(back + spread) * size;
   const x2 = x + Math.cos(back - spread) * size;
   const y2 = y + Math.sin(back - spread) * size;
-  return `M${x.toFixed(2)},${y.toFixed(2)} L${x1.toFixed(2)},${y1.toFixed(2)} L${x2.toFixed(2)},${y2.toFixed(2)} Z`;
+  return [
+    [x, y],
+    [x1, y1],
+    [x2, y2],
+  ];
+}
+
+/** Triangle plein pointant selon `angle` (radians), pointe en (x, y). */
+function arrowHeadPath(x: number, y: number, angle: number, size: number): string {
+  const [[px, py], [x1, y1], [x2, y2]] = arrowHeadPoints(x, y, angle, size);
+  return `M${px.toFixed(2)},${py.toFixed(2)} L${x1.toFixed(2)},${y1.toFixed(2)} L${x2.toFixed(2)},${y2.toFixed(2)} Z`;
 }
 
 /**
@@ -237,6 +247,605 @@ function curvedPath(pts: [number, number][]): { d: string; endAngle: number } {
   return { d, endAngle };
 }
 
+/**
+ * Tuile de motif hachuré (petit canvas offscreen mis en cache) — reproduit
+ * le contenu d'un `<pattern>` SVG *sans* sa rotation : `patternTransform`
+ * fait pivoter toute la grille de répétition comme un bloc rigide, ce qui
+ * ne carrelle proprement à n'importe quel angle que si la rotation est
+ * appliquée à `CanvasPattern.setTransform(...)`, pas dessinée dans la
+ * tuile elle-même (sinon coutures visibles à tout angle hors 45°).
+ */
+interface PatternSpec {
+  id: string;
+  size: number;
+  angleDeg: number;
+  draw: (tileCtx: CanvasRenderingContext2D, size: number) => void;
+}
+
+const IMPASSABLE_PATTERN_ID = "impassable-hatch";
+
+function drawImpassableTile(tileCtx: CanvasRenderingContext2D, size: number) {
+  tileCtx.fillStyle = "#141210";
+  tileCtx.fillRect(0, 0, size, size);
+  tileCtx.strokeStyle = "#3a3632";
+  tileCtx.lineWidth = 2;
+  tileCtx.beginPath();
+  tileCtx.moveTo(0, 0);
+  tileCtx.lineTo(0, size);
+  tileCtx.stroke();
+}
+
+function drawOccupiedTile(colorA: string, colorB: string) {
+  return (tileCtx: CanvasRenderingContext2D, size: number) => {
+    tileCtx.globalAlpha = 0.85;
+    tileCtx.fillStyle = colorB;
+    tileCtx.fillRect(0, 0, size, size);
+    tileCtx.fillStyle = colorA;
+    tileCtx.fillRect(0, 0, size / 2, size);
+    tileCtx.globalAlpha = 1;
+  };
+}
+
+function drawDriftTile(color: string) {
+  return (tileCtx: CanvasRenderingContext2D, size: number) => {
+    tileCtx.globalAlpha = 0.1;
+    tileCtx.fillStyle = color;
+    tileCtx.fillRect(0, 0, size, size);
+    tileCtx.globalAlpha = 0.65;
+    tileCtx.strokeStyle = color;
+    tileCtx.lineWidth = 2.5;
+    tileCtx.setLineDash([2, 3]);
+    tileCtx.beginPath();
+    tileCtx.moveTo(0, 0);
+    tileCtx.lineTo(0, size);
+    tileCtx.stroke();
+    tileCtx.setLineDash([]);
+    tileCtx.globalAlpha = 1;
+  };
+}
+
+function getOrBuildPattern(
+  ctx: CanvasRenderingContext2D,
+  cache: Map<string, CanvasPattern>,
+  spec: PatternSpec,
+): CanvasPattern | null {
+  const cached = cache.get(spec.id);
+  if (cached) return cached;
+  const tile = document.createElement("canvas");
+  tile.width = spec.size;
+  tile.height = spec.size;
+  const tileCtx = tile.getContext("2d");
+  if (!tileCtx) return null;
+  spec.draw(tileCtx, spec.size);
+  const pattern = ctx.createPattern(tile, "repeat");
+  if (!pattern) return null;
+  if (spec.angleDeg) pattern.setTransform(new DOMMatrix().rotate(spec.angleDeg));
+  cache.set(spec.id, pattern);
+  return pattern;
+}
+
+/** Épaisseur de trait constante à l'écran quel que soit le zoom (équivalent canvas de `vectorEffect="non-scaling-stroke"`). */
+function paintNonScalingStroke(
+  ctx: CanvasRenderingContext2D,
+  path: Path2D,
+  color: string,
+  cssWidth: number,
+  k: number,
+) {
+  ctx.lineWidth = cssWidth / k;
+  ctx.strokeStyle = color;
+  ctx.stroke(path);
+}
+
+/**
+ * Géométrie pré-construite (Path2D + styles déjà résolus) de toute la
+ * couche statique de la carte — reconstruite uniquement quand le contenu
+ * change (niveau, sélection, tick de jour…), jamais à chaque frame de
+ * caméra. `paintStaticGeometry` ne fait que la rejouer.
+ */
+interface StaticGeometry {
+  mapW: number;
+  mapH: number;
+  ocean: {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    depth: { cx: number; cy: number; r: number };
+    atlantique: { x1: number; y1: number; x2: number; y2: number };
+  };
+  land: Path2D | null;
+  units: { path2d: Path2D; fill: string; fillOpacity: number; stroke: string; strokeWidth: number }[];
+  hoverOutline: { path2d: Path2D; fill: string; stroke: string } | null;
+  occupiedOverlays: { path2d: Path2D; patternId: string }[];
+  occupiedHatchSpecs: PatternSpec[];
+  enemyRealmBorderOverlays: { path2d: Path2D }[];
+  warGoalOverlays: { path2d: Path2D }[];
+  siegeOverlays: { path2d: Path2D; color: string; opacity: number }[];
+  driftOverlays: { path2d: Path2D; patternId: string; color: string }[];
+  driftHatchSpecs: PatternSpec[];
+  hillshade: HTMLCanvasElement | null;
+  impassable: { path2d: Path2D } | null;
+  rivers: Path2D | null;
+  landOutline: Path2D | null;
+  cityMarkers: { x: number; y: number; r: number; fill: string; strokeWidth: number }[];
+  selectedKingdomOutline: { path2d: Path2D; stroke: string } | null;
+  claimFocusOutline: { path2d: Path2D; stroke: string } | null;
+  armyMoveArrows: {
+    path2d: Path2D;
+    head: Path2D;
+    headCenter: [number, number];
+    color: string;
+    friendly: boolean;
+  }[];
+  /** Peint sur un canvas séparé (`drawLabelLayer`), pas ici — regroupé dans la même géométrie car construit à partir des mêmes déclencheurs de contenu. */
+  labels: LabelPaint[];
+}
+
+/** Rejoue `geo` sur `ctx` (déjà positionné avec la transform caméra courante) — dans le même ordre de peinture que l'ancien rendu SVG. */
+function paintStaticGeometry(
+  ctx: CanvasRenderingContext2D,
+  geo: StaticGeometry,
+  k: number,
+  patternCache: Map<string, CanvasPattern>,
+) {
+  ctx.lineCap = "butt";
+  ctx.lineJoin = "round";
+  ctx.setLineDash([]);
+
+  // Océan.
+  const { x: ox, y: oy, w: ow, h: oh } = geo.ocean;
+  const depthGrad = ctx.createRadialGradient(
+    geo.ocean.depth.cx,
+    geo.ocean.depth.cy,
+    0,
+    geo.ocean.depth.cx,
+    geo.ocean.depth.cy,
+    geo.ocean.depth.r,
+  );
+  depthGrad.addColorStop(0, "#4a7382");
+  depthGrad.addColorStop(0.28, "#3a5f6e");
+  depthGrad.addColorStop(0.58, "#2a4a58");
+  depthGrad.addColorStop(1, "#152832");
+  ctx.fillStyle = depthGrad;
+  ctx.fillRect(ox, oy, ow, oh);
+  const atlGrad = ctx.createLinearGradient(
+    geo.ocean.atlantique.x1,
+    geo.ocean.atlantique.y1,
+    geo.ocean.atlantique.x2,
+    geo.ocean.atlantique.y2,
+  );
+  atlGrad.addColorStop(0, "rgba(16, 31, 40, 0.75)");
+  atlGrad.addColorStop(0.55, "rgba(26, 51, 64, 0.25)");
+  atlGrad.addColorStop(1, "rgba(42, 74, 88, 0)");
+  ctx.fillStyle = atlGrad;
+  ctx.fillRect(ox, oy, ow, oh);
+
+  // Terre.
+  if (geo.land) {
+    ctx.fillStyle = LAND_COLOR;
+    ctx.fill(geo.land);
+  }
+
+  // Domaines/provinces/royaumes + overlays. Pas de clip sur le masque
+  // terrestre grossier ici (contrairement au relief plus bas) : ce masque
+  // ne couvre pas certains îlots/franges côtières que les frontières fines
+  // des domaines couvrent bien — le clip masquait alors entièrement le
+  // remplissage de ces territoires tout en laissant leur libellé de texte
+  // s'afficher (non clippé), donnant des noms flottant sans couleur en
+  // dessous. Chaque unité a déjà sa propre géométrie précise, pas besoin
+  // du masque grossier pour la contenir.
+  for (const u of geo.units) {
+    ctx.globalAlpha = u.fillOpacity;
+    ctx.fillStyle = u.fill;
+    ctx.fill(u.path2d);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = u.stroke;
+    ctx.lineWidth = u.strokeWidth;
+    ctx.stroke(u.path2d);
+  }
+  if (geo.hoverOutline) {
+    ctx.globalAlpha = 0.28;
+    ctx.fillStyle = geo.hoverOutline.fill;
+    ctx.fill(geo.hoverOutline.path2d);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "#f5f0e6";
+    ctx.lineWidth = 2.8;
+    ctx.stroke(geo.hoverOutline.path2d);
+  }
+  for (const o of geo.occupiedOverlays) {
+    const spec = geo.occupiedHatchSpecs.find((s) => s.id === o.patternId);
+    const pattern = spec ? getOrBuildPattern(ctx, patternCache, spec) : null;
+    if (pattern) {
+      ctx.fillStyle = pattern;
+      ctx.fill(o.path2d);
+    }
+  }
+  for (const o of geo.enemyRealmBorderOverlays) {
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = WAR_ENEMY_COLOR;
+    ctx.lineWidth = 2.2;
+    ctx.stroke(o.path2d);
+  }
+  ctx.globalAlpha = 1;
+  for (const o of geo.warGoalOverlays) {
+    ctx.globalAlpha = 0.9;
+    ctx.strokeStyle = "#e8b93d";
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([5, 3]);
+    ctx.stroke(o.path2d);
+  }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+  for (const o of geo.siegeOverlays) {
+    ctx.globalAlpha = o.opacity;
+    ctx.fillStyle = o.color;
+    ctx.fill(o.path2d);
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = o.color;
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke(o.path2d);
+  }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+  for (const o of geo.driftOverlays) {
+    const spec = geo.driftHatchSpecs.find((s) => s.id === o.patternId);
+    const pattern = spec ? getOrBuildPattern(ctx, patternCache, spec) : null;
+    if (pattern) {
+      ctx.fillStyle = pattern;
+      ctx.fill(o.path2d);
+    }
+    ctx.globalAlpha = 0.7;
+    ctx.strokeStyle = o.color;
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([1, 4]);
+    ctx.stroke(o.path2d);
+  }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+
+  // Relief (hillshade), fondu multiplicatif, clippé à la terre.
+  if (geo.hillshade && geo.land) {
+    ctx.save();
+    ctx.clip(geo.land);
+    ctx.globalCompositeOperation = "multiply";
+    ctx.globalAlpha = 0.32;
+    ctx.drawImage(geo.hillshade, 0, 0, geo.mapW, geo.mapH);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.restore();
+  }
+
+  // Zones infranchissables.
+  if (geo.impassable) {
+    const spec: PatternSpec = { id: IMPASSABLE_PATTERN_ID, size: 7, angleDeg: 35, draw: drawImpassableTile };
+    const pattern = getOrBuildPattern(ctx, patternCache, spec);
+    if (pattern) {
+      ctx.fillStyle = pattern;
+      ctx.fill(geo.impassable.path2d);
+    }
+    ctx.strokeStyle = "#0a0908";
+    ctx.lineWidth = 0.8;
+    ctx.stroke(geo.impassable.path2d);
+  }
+
+  // Rivières.
+  if (geo.rivers) {
+    ctx.globalAlpha = 0.95;
+    ctx.lineCap = "round";
+    paintNonScalingStroke(ctx, geo.rivers, "#2a6a8a", 1.35, k);
+    ctx.globalAlpha = 1;
+    ctx.lineCap = "butt";
+  }
+
+  // Contour côtier.
+  if (geo.landOutline) {
+    paintNonScalingStroke(ctx, geo.landOutline, "rgba(18, 28, 36, 0.85)", 1.2, k);
+  }
+
+  // Villes.
+  for (const c of geo.cityMarkers) {
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+    ctx.fillStyle = c.fill;
+    ctx.fill();
+    ctx.lineWidth = c.strokeWidth / k;
+    ctx.strokeStyle = "#efe6d4";
+    ctx.stroke();
+  }
+
+  // Contours sélection / claim.
+  if (geo.selectedKingdomOutline) {
+    ctx.globalAlpha = 0.92;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = geo.selectedKingdomOutline.stroke;
+    ctx.lineWidth = 2.4;
+    ctx.stroke(geo.selectedKingdomOutline.path2d);
+    ctx.globalAlpha = 1;
+    ctx.lineCap = "butt";
+  }
+  if (geo.claimFocusOutline) {
+    ctx.globalAlpha = 0.95;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = geo.claimFocusOutline.stroke;
+    ctx.lineWidth = 3.2;
+    ctx.stroke(geo.claimFocusOutline.path2d);
+    ctx.globalAlpha = 1;
+    ctx.lineCap = "butt";
+  }
+
+  // Flèches de marche.
+  ctx.lineCap = "round";
+  for (const a of geo.armyMoveArrows) {
+    ctx.globalAlpha = 0.9;
+    if (!a.friendly) ctx.setLineDash([3, 2.5]);
+    paintNonScalingStroke(ctx, a.path2d, "#f5f0e6", a.friendly ? 3 : 2.4, k);
+    ctx.globalAlpha = a.friendly ? 0.95 : 0.75;
+    paintNonScalingStroke(ctx, a.path2d, a.color, a.friendly ? 1.6 : 1.1, k);
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = "#f5f0e6";
+    ctx.fill(a.head);
+    ctx.globalAlpha = a.friendly ? 0.95 : 0.75;
+    ctx.fillStyle = a.color;
+    ctx.save();
+    ctx.translate(a.headCenter[0], a.headCenter[1]);
+    ctx.scale(0.72, 0.72);
+    ctx.translate(-a.headCenter[0], -a.headCenter[1]);
+    ctx.fill(a.head);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+  ctx.lineCap = "butt";
+}
+
+/* ------------------------------------------------------------------ */
+/* Libellés de territoire peints au canvas (plus de <text>/<textPath> SVG) */
+/* ------------------------------------------------------------------ */
+
+const LABEL_FONT_FAMILY = "Palatino, 'Palatino Linotype', 'Book Antiqua', 'Times New Roman', serif";
+
+/** Contexte 2D jetable, uniquement pour `measureText` au moment de la construction de la géométrie — jamais utilisé pour peindre à l'écran. */
+let measureCtx: CanvasRenderingContext2D | null = null;
+function getMeasureCtx(): CanvasRenderingContext2D {
+  if (!measureCtx) measureCtx = document.createElement("canvas").getContext("2d");
+  return measureCtx!;
+}
+
+/**
+ * Échantillonnage régulier d'une quadratique (`M x0,y0 Q cx,cy x1,y1`) pour
+ * retrouver une position par longueur d'arc — les courbes de libellé de
+ * royaume sont toujours très légèrement bombées (voir `territoryBend` dans
+ * territoryLabels.ts), un échantillonnage grossier suffit largement.
+ */
+function sampleQuadraticByLength(
+  x0: number,
+  y0: number,
+  cx: number,
+  cy: number,
+  x1: number,
+  y1: number,
+): { total: number; pointAt: (len: number) => { x: number; y: number; angle: number } } {
+  const N = 32;
+  const pts: { x: number; y: number; len: number }[] = [{ x: x0, y: y0, len: 0 }];
+  let prevX = x0;
+  let prevY = y0;
+  let acc = 0;
+  for (let i = 1; i <= N; i++) {
+    const t = i / N;
+    const mt = 1 - t;
+    const x = mt * mt * x0 + 2 * mt * t * cx + t * t * x1;
+    const y = mt * mt * y0 + 2 * mt * t * cy + t * t * y1;
+    acc += Math.hypot(x - prevX, y - prevY);
+    pts.push({ x, y, len: acc });
+    prevX = x;
+    prevY = y;
+  }
+  const total = acc;
+  function pointAt(targetLen: number) {
+    const len = Math.max(0, Math.min(total, targetLen));
+    let i = 1;
+    while (i < pts.length - 1 && pts[i].len < len) i++;
+    const a = pts[i - 1];
+    const b = pts[i];
+    const segLen = b.len - a.len || 1;
+    const frac = (len - a.len) / segLen;
+    return {
+      x: a.x + (b.x - a.x) * frac,
+      y: a.y + (b.y - a.y) * frac,
+      angle: Math.atan2(b.y - a.y, b.x - a.x),
+    };
+  }
+  return { total, pointAt };
+}
+
+const QUAD_D_RE = /M(-?[\d.]+),(-?[\d.]+)\s+Q(-?[\d.]+),(-?[\d.]+)\s+(-?[\d.]+),(-?[\d.]+)/;
+
+interface CurvedGlyph {
+  char: string;
+  x: number;
+  y: number;
+  angle: number;
+}
+
+/**
+ * Place chaque caractère de `text` le long de la courbe `d` (quadratique,
+ * toujours produite par `curvedPath` dans territoryLabels.ts), centré sur
+ * la longueur totale — équivalent canvas de
+ * `<textPath startOffset="50%" textAnchor="middle">`.
+ */
+function layoutCurvedText(d: string, text: string, fontPx: number): CurvedGlyph[] {
+  const m = QUAD_D_RE.exec(d);
+  if (!m) return [];
+  const [x0, y0, cx, cy, x1, y1] = m.slice(1).map(Number);
+  const { total, pointAt } = sampleQuadraticByLength(x0, y0, cx, cy, x1, y1);
+  const ctx = getMeasureCtx();
+  ctx.font = `700 ${fontPx}px ${LABEL_FONT_FAMILY}`;
+  const chars = [...text];
+  const widths = chars.map((ch) => ctx.measureText(ch).width);
+  const textWidth = widths.reduce((a, b) => a + b, 0);
+  let cursor = total / 2 - textWidth / 2;
+  const glyphs: CurvedGlyph[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    const w = widths[i];
+    const { x, y, angle } = pointAt(cursor + w / 2);
+    glyphs.push({ char: chars[i], x, y, angle });
+    cursor += w;
+  }
+  return glyphs;
+}
+
+interface LabelPaintFlat {
+  kind: "flat";
+  lines: string[];
+  x: number;
+  y: number;
+  angleDeg: number;
+  fontSize: number;
+}
+interface LabelPaintCurved {
+  kind: "curved";
+  lines: { glyphs: CurvedGlyph[] }[];
+  fontSize: number;
+}
+type LabelPaint = LabelPaintFlat | LabelPaintCurved;
+
+function paintLabels(ctx: CanvasRenderingContext2D, labels: LabelPaint[]) {
+  ctx.lineJoin = "round";
+  ctx.textAlign = "center";
+  for (const l of labels) {
+    if (l.kind === "flat") {
+      ctx.font = `600 ${l.fontSize}px ${LABEL_FONT_FAMILY}`;
+      ctx.textBaseline = "middle";
+      ctx.strokeStyle = "rgba(245, 236, 220, 0.5)";
+      ctx.lineWidth = 0.9;
+      ctx.fillStyle = "#1a1510";
+      const lineH = l.fontSize * 1.05;
+      const startY = l.y - ((l.lines.length - 1) * lineH) / 2;
+      const rot = Math.abs(l.angleDeg) > 0.5 ? (l.angleDeg * Math.PI) / 180 : 0;
+      ctx.save();
+      if (rot) {
+        ctx.translate(l.x, l.y);
+        ctx.rotate(rot);
+        ctx.translate(-l.x, -l.y);
+      }
+      l.lines.forEach((line, i) => {
+        const y = startY + i * lineH;
+        ctx.strokeText(line, l.x, y);
+        ctx.fillText(line, l.x, y);
+      });
+      ctx.restore();
+    } else {
+      ctx.font = `700 ${l.fontSize}px ${LABEL_FONT_FAMILY}`;
+      ctx.textBaseline = "alphabetic";
+      ctx.strokeStyle = "rgba(245, 236, 220, 0.55)";
+      ctx.lineWidth = 1.1;
+      ctx.fillStyle = "#1a1510";
+      for (const line of l.lines) {
+        for (const g of line.glyphs) {
+          ctx.save();
+          ctx.translate(g.x, g.y);
+          ctx.rotate(g.angle);
+          ctx.strokeText(g.char, 0, 0);
+          ctx.fillText(g.char, 0, 0);
+          ctx.restore();
+        }
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Marqueurs d'armée peints au canvas (plus de <g>/<rect>/<text> SVG)    */
+/* ------------------------------------------------------------------ */
+
+interface ArmyMarkerPaint {
+  id: number;
+  x: number;
+  y: number;
+  angleDeg: number;
+  troops: number;
+  stance: Army["stance"];
+  color: string;
+  labelColor: string;
+}
+
+/** Palier `t` de l'oscillation `stroke-opacity` CSS `army-battle-pulse` (0.55 → 1 → 0.55 sur 1s, approximé en cosinus). */
+function battlePulseOpacity(nowMs: number): number {
+  return 0.775 - 0.225 * Math.cos((2 * Math.PI * nowMs) / 1000);
+}
+
+function paintArmyMarkers(
+  ctx: CanvasRenderingContext2D,
+  markers: ArmyMarkerPaint[],
+  selectedArmyId: number | null,
+  k: number,
+  pulseOpacity: number,
+) {
+  const w = 8.4;
+  const h = 12;
+  for (const m of markers) {
+    const tier = armySizeTier(m.troops);
+    const glyph = armyGlyphParts(tier, -w / 2, -h / 2, w, h);
+    const angleRad = (m.angleDeg * Math.PI) / 180;
+
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    ctx.rotate(angleRad);
+
+    if (selectedArmyId === m.id) {
+      ctx.strokeStyle = "#f5f0e6";
+      ctx.lineWidth = 1.2 / k;
+      ctx.strokeRect(-w / 2 - 2.5, -h / 2 - 2.5, w + 5, h + 5);
+    }
+
+    ctx.globalAlpha = m.stance === "routing" ? 0.55 : 1;
+    ctx.fillStyle = m.color;
+    ctx.fillRect(-w / 2, -h / 2, w, h);
+    ctx.globalAlpha = m.stance === "battling" ? pulseOpacity : 1;
+    ctx.strokeStyle = m.stance === "battling" ? "#c23b2a" : "#1a1510";
+    ctx.lineWidth = (m.stance === "battling" ? 2.2 : 1) / k;
+    if (m.stance === "sieging") ctx.setLineDash([2 / k, 1.5 / k]);
+    else if (m.stance === "routing") ctx.setLineDash([1 / k, 1.4 / k]);
+    ctx.strokeRect(-w / 2, -h / 2, w, h);
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+
+    ctx.strokeStyle = "#1a1510";
+    ctx.lineWidth = 0.8 / k;
+    for (const [x1, y1, x2, y2] of glyph.lines) {
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "#1a1510";
+    for (const [dx, dy] of glyph.dots) {
+      ctx.beginPath();
+      ctx.arc(dx, dy, 0.75, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // Libellé du nombre de troupes — jamais tourné (groupe séparé en SVG à l'origine).
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    ctx.font = "5.5px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = "#1a1510";
+    ctx.lineWidth = 0.6;
+    ctx.fillStyle = m.labelColor;
+    const text = formatCount(m.troops);
+    const ty = h / 2 + 6.5;
+    ctx.strokeText(text, 0, ty);
+    ctx.fillText(text, 0, ty);
+    ctx.restore();
+  }
+}
+
 export function MapView({
   world,
   level,
@@ -262,19 +871,137 @@ export function MapView({
 }: MapViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const worldGroupRef = useRef<SVGGElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const dynamicCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const dynamicCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const labelCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const labelCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const staticGeometryRef = useRef<StaticGeometry | null>(null);
+  const dynamicGeometryRef = useRef<{
+    markers: ArmyMarkerPaint[];
+    selectedArmyId: number | null;
+  }>({ markers: [], selectedArmyId: null });
+  const patternCacheRef = useRef<Map<string, CanvasPattern>>(new Map());
   const [size, setSize] = useState({ w: 0, h: 0 });
-  const [hillshadeUrl, setHillshadeUrl] = useState<string | null>(null);
+  const [hillshadeCanvas, setHillshadeCanvas] = useState<HTMLCanvasElement | null>(null);
   const [selectedCity, setSelectedCity] = useState<City | null>(null);
   const camRef = useRef({ x: 0, y: 0, k: 1 });
   const framedRef = useRef(false);
   const dragRef = useRef<{ x: number; y: number; camX: number; camY: number } | null>(null);
   const movedRef = useRef(false);
+  const camRafRef = useRef(0);
+
+  /**
+   * Rejoue toute la couche statique (terre, domaines, overlays, relief,
+   * villes, contours, flèches de marche) sur le `<canvas>` posé sous le SVG.
+   * N'accède qu'à des refs et à des propriétés DOM live (jamais à `size`,
+   * aux props ou au state par fermeture) : cette fonction est aussi appelée
+   * depuis `onWheel`, figé une bonne fois pour toutes par `useCallback([])`
+   * (voir plus bas) — sa fermeture ne verrait plus jamais une valeur de
+   * state mise à jour après le montage.
+   */
+  function drawStaticLayer() {
+    const ctx = ctxRef.current;
+    const canvas = canvasRef.current;
+    if (!ctx || !canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth;
+    const cssH = canvas.clientHeight;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+    ctx.fillStyle = "#152832";
+    ctx.fillRect(0, 0, cssW, cssH);
+    const geo = staticGeometryRef.current;
+    if (!geo) return;
+    const c = camRef.current;
+    ctx.setTransform(dpr * c.k, 0, 0, dpr * c.k, dpr * c.x, dpr * c.y);
+    paintStaticGeometry(ctx, geo, c.k, patternCacheRef.current);
+  }
+
+  /**
+   * Libellés de territoire — canvas séparé, empilé au-dessus des marqueurs
+   * d'armée (même ordre de peinture que l'ancien SVG où les libellés
+   * passaient en dernier). Redessiné avec les mêmes déclencheurs que
+   * `drawStaticLayer` (même géométrie source, `staticGeometryRef.labels`),
+   * juste sur une surface différente pour préserver cet empilement.
+   */
+  function drawLabelLayer() {
+    const ctx = labelCtxRef.current;
+    const canvas = labelCanvasRef.current;
+    if (!ctx || !canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth;
+    const cssH = canvas.clientHeight;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+    const geo = staticGeometryRef.current;
+    if (!geo) return;
+    const c = camRef.current;
+    ctx.setTransform(dpr * c.k, 0, 0, dpr * c.k, dpr * c.x, dpr * c.y);
+    paintLabels(ctx, geo.labels);
+  }
+
+  /**
+   * Marqueurs d'armée — canvas séparé (entre la couche statique et les
+   * libellés) redessiné à sa propre cadence, indépendante de la caméra :
+   * `dayProgress` avance ~20×/s pendant qu'une armée marche, et le tout mis
+   * ensemble sur le canvas statique aurait fallu re-rastériser les ~750
+   * domaines à ce rythme — exactement le problème que la mémoïsation
+   * `staticMapLayer`/`staticGeometry` évite déjà côté contenu statique.
+   */
+  function drawDynamicLayer() {
+    const ctx = dynamicCtxRef.current;
+    const canvas = dynamicCanvasRef.current;
+    if (!ctx || !canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth;
+    const cssH = canvas.clientHeight;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+    const { markers, selectedArmyId } = dynamicGeometryRef.current;
+    if (!markers.length) return;
+    const c = camRef.current;
+    ctx.setTransform(dpr * c.k, 0, 0, dpr * c.k, dpr * c.x, dpr * c.y);
+    paintArmyMarkers(ctx, markers, selectedArmyId, c.k, battlePulseOpacity(performance.now()));
+  }
 
   function applyCam() {
     const c = camRef.current;
     const g = worldGroupRef.current;
     if (g) g.setAttribute("transform", `translate(${c.x} ${c.y}) scale(${c.k})`);
+    // Les trois appels sont synchrones, dans le même tick JS que la mise à
+    // jour de `g` juste au-dessus : le navigateur ne peut composer une
+    // frame qu'une fois ce tick terminé, donc les trois canvases (et le SVG,
+    // qui ne porte plus rien de visible) affichent forcément le même état de
+    // caméra au même instant — plus de risque de désynchronisation visuelle
+    // entre eux, contrairement à une transform SVG (composée par le GPU,
+    // quasi immédiate) posée à côté d'un canvas qui doit vraiment
+    // re-rastériser (retard possible pendant un mouvement rapide et continu).
+    drawStaticLayer();
+    drawLabelLayer();
+    drawDynamicLayer();
   }
+
+  /**
+   * `pointermove`/`wheel` peuvent tirer bien plus vite que l'écran ne rafraîchit
+   * (souris/trackpad haute fréquence) — appliquer la caméra à chaque évènement
+   * brut fait retransformer (et re-rastériser) la carte plusieurs fois pour une
+   * seule image affichée. On ne garde que la dernière position par frame.
+   */
+  function scheduleApplyCam() {
+    if (camRafRef.current) return;
+    camRafRef.current = requestAnimationFrame(() => {
+      camRafRef.current = 0;
+      applyCam();
+    });
+  }
+
+  useEffect(() => {
+    return () => {
+      if (camRafRef.current) cancelAnimationFrame(camRafRef.current);
+    };
+  }, []);
 
   const { bbox } = world;
   const latAvgRad = (((bbox.latMin + bbox.latMax) / 2) * Math.PI) / 180;
@@ -308,6 +1035,7 @@ export function MapView({
     [world.rivers, toXY],
   );
 
+
   // Vue Guerre uniquement (jamais en filtre Possession) : rouge = camp
   // adverse (y compris ses alliés venus prêter main-forte), vert = mes
   // propres alliés ayant rejoint cette guerre.
@@ -335,6 +1063,27 @@ export function MapView({
     return { warEnemyIds: [...enemies], warAllyIds: [...allies] };
   }, [wars, viewerId, focusWarId]);
 
+  // Vue Alliances : ennemis de guerre du focus actuel (joueur par défaut, ou
+  // personnage sélectionné) — indépendant de `focusWarId` (qui ne concerne
+  // que l'onglet Guerre) : on veut TOUTES les guerres en cours du focus,
+  // pour pouvoir inspecter n'importe quel pays sélectionné, pas seulement soi.
+  const allianceEnemyIds = useMemo(() => {
+    if (playerId == null) return [] as number[];
+    const enemies = new Set<number>();
+    for (const w of wars) {
+      const side = warSideOf(w, playerId);
+      if (!side) continue;
+      if (side === "attacker") {
+        enemies.add(w.defenderId);
+        for (const id of w.allyOfDefender || []) enemies.add(id);
+      } else {
+        enemies.add(w.attackerId);
+        for (const id of w.allyOfAttacker || []) enemies.add(id);
+      }
+    }
+    return [...enemies];
+  }, [wars, playerId]);
+
   const warView = level === "war";
 
   const units = useMemo(() => {
@@ -345,6 +1094,8 @@ export function MapView({
       opinions,
       titles,
       alliances,
+      armies,
+      allianceEnemyIds,
     });
   }, [
     world,
@@ -355,6 +1106,8 @@ export function MapView({
     opinions,
     titles,
     alliances,
+    armies,
+    allianceEnemyIds,
     warView,
     viewerId,
     warEnemyIds,
@@ -493,36 +1246,70 @@ export function MapView({
   }, [occupiedOverlays]);
 
   /**
-   * Territoire réellement en jeu dans la guerre mise en avant — ce qui
+   * Territoire réellement en jeu dans mes guerres en cours — ce qui
    * basculera à la victoire : le war goal précis pour une guerre de claim,
    * sinon le royaume adverse en entier (indépendance, renversement, ou
    * conquête sans claim précise) — même dénominateur que `canPressDemands`.
    * Simple contour, ne touche pas au remplissage (self/ennemi/allié/neutre).
+   * En vue Guerre avec une guerre précise mise en avant, restreint à celle-ci
+   * — sinon (vue Possession, ou vue Guerre sans focus) couvre TOUTES mes
+   * guerres en cours à la fois, pour repérer chaque front d'un coup d'œil
+   * même sans passer par l'onglet Guerre.
    */
   const warGoalOverlays = useMemo(() => {
-    if (!warView || viewerId == null || focusWarId == null) return [];
-    const war = wars.find((w) => w.id === focusWarId);
-    if (!war) return [];
-    const mySide = warSideOf(war, viewerId);
-    if (!mySide) return [];
-    const cb = war.casusBelli ?? "claim_province";
-    const goalIds =
-      mySide === "attacker"
-        ? (cb === "claim_province" || cb === "conquest") && war.warGoalDomainIds?.length
-          ? war.warGoalDomainIds
-          : war.conquestOrder
-        : war.attackerFrontOrder;
-    if (!goalIds?.length) return [];
+    if (viewerId == null) return [];
+    if (level !== "war" && level !== "possession" && level !== "domaine") return [];
+    const relevantWars =
+      warView && focusWarId != null ? wars.filter((w) => w.id === focusWarId) : wars;
     const out: { key: string; d: string }[] = [];
-    for (const domainId of goalIds) {
-      const domaine = world.domaines.find((d) => d.id === domainId) ?? world.domaines[domainId];
-      if (!domaine?.boundary?.length) continue;
-      const d = ringsToPath(domaine.boundary, toXY);
-      if (!d) continue;
-      out.push({ key: `goal-${domainId}`, d });
+    const seenDomains = new Set<number>();
+    for (const war of relevantWars) {
+      const mySide = warSideOf(war, viewerId);
+      if (!mySide) continue;
+      const cb = war.casusBelli ?? "claim_province";
+      const goalIds =
+        mySide === "attacker"
+          ? (cb === "claim_province" || cb === "conquest") && war.warGoalDomainIds?.length
+            ? war.warGoalDomainIds
+            : war.conquestOrder
+          : war.attackerFrontOrder;
+      if (!goalIds?.length) continue;
+      for (const domainId of goalIds) {
+        if (seenDomains.has(domainId)) continue;
+        seenDomains.add(domainId);
+        const domaine = world.domaines.find((d) => d.id === domainId) ?? world.domaines[domainId];
+        if (!domaine?.boundary?.length) continue;
+        const d = ringsToPath(domaine.boundary, toXY);
+        if (!d) continue;
+        out.push({ key: `goal-${domainId}`, d });
+      }
     }
     return out;
-  }, [warView, viewerId, focusWarId, wars, world, toXY]);
+  }, [viewerId, level, warView, focusWarId, wars, world, toXY]);
+
+  /**
+   * Frontière de chaque royaume ennemi (toutes guerres en cours confondues)
+   * — simple liseret par-dessus la vue Possession, pour repérer qui on
+   * affronte sans devoir passer par l'onglet Guerre.
+   */
+  const enemyRealmBorderOverlays = useMemo(() => {
+    if (viewerId == null || (level !== "possession" && level !== "domaine")) return [];
+    const out: { key: string; d: string }[] = [];
+    const seen = new Set<number>();
+    for (const war of wars) {
+      const side = warSideOf(war, viewerId);
+      if (!side) continue;
+      const enemyId = side === "attacker" ? war.defenderId : war.attackerId;
+      if (seen.has(enemyId)) continue;
+      seen.add(enemyId);
+      const rings = getRealmBoundary(world, enemyId);
+      if (!rings.length) continue;
+      const d = ringsToPath(rings, toXY);
+      if (!d) continue;
+      out.push({ key: `enemy-border-${enemyId}`, d });
+    }
+    return out;
+  }, [wars, viewerId, world, toXY, level]);
 
   /**
    * Domaines qui comptent pour l’une de mes propres guerres (objectifs,
@@ -678,7 +1465,14 @@ export function MapView({
    */
   const armyMoveArrows = useMemo(() => {
     if (!armies.length) return [];
-    const out: { id: number; d: string; head: string; color: string; friendly: boolean }[] = [];
+    const out: {
+      id: number;
+      d: string;
+      head: string;
+      headPoints: [number, number][];
+      color: string;
+      friendly: boolean;
+    }[] = [];
     for (const army of armies) {
       if (army.stance !== "moving" || !army.path?.length) continue;
       const friendly = viewerId != null && army.ownerId === viewerId;
@@ -699,10 +1493,12 @@ export function MapView({
       if (!ok || pts.length < 2) continue;
       const { d, endAngle } = curvedPath(pts);
       const [ex, ey] = pts[pts.length - 1];
+      const headSize = friendly ? 5 : 4;
       out.push({
         id: army.id,
         d,
-        head: arrowHeadPath(ex, ey, endAngle, friendly ? 5 : 4),
+        head: arrowHeadPath(ex, ey, endAngle, headSize),
+        headPoints: arrowHeadPoints(ex, ey, endAngle, headSize),
         color: possessionColor(world, army.ownerId),
         friendly,
       });
@@ -942,16 +1738,24 @@ export function MapView({
                 (world.bbox.lonMax - world.bbox.lonMin)),
           ),
         );
-        const url = canvas.toDataURL("image/png");
-        if (!cancelled) setHillshadeUrl(url);
+        // `buildHillshadeCanvas` renvoie déjà un canvas — `ctx.drawImage`
+        // l'accepte directement, inutile de repasser par `toDataURL()` +
+        // un `<img>`/`<image>` qui redécoderait un PNG en base64 pour rien.
+        if (!cancelled) setHillshadeCanvas(canvas);
       } catch {
-        if (!cancelled) setHillshadeUrl(null);
+        if (!cancelled) setHillshadeCanvas(null);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [world]);
+    // Le relief (heightmap/bbox) ne change jamais en jeu — seuls dépendent
+    // ici, volontairement pas `world` en entier, qui change de référence à
+    // chaque jour calendaire (`cloneWorldMutable`) et relançait tout le
+    // traitement d'image (flou, échantillonnage d'élévation) plusieurs fois
+    // par seconde à vitesse 3×.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [world.heightmap, world.bbox]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -963,6 +1767,32 @@ export function MapView({
     setSize({ w: el.clientWidth, h: el.clientHeight });
     return () => ro.disconnect();
   }, []);
+
+  // Contextes 2D pris une fois au montage (les trois canvases empilés).
+  useEffect(() => {
+    ctxRef.current = canvasRef.current?.getContext("2d") ?? null;
+    dynamicCtxRef.current = dynamicCanvasRef.current?.getContext("2d") ?? null;
+    labelCtxRef.current = labelCanvasRef.current?.getContext("2d") ?? null;
+  }, []);
+
+  /**
+   * Le buffer de chaque canvas (résolution interne, distincte de sa taille
+   * CSS) doit être redimensionné manuellement — le SVG gère nativement le
+   * DPR (vecteur, toujours net), pas le canvas. Un resize vide aussi son
+   * contenu, d'où le redessin explicite juste après.
+   */
+  useEffect(() => {
+    const canvases = [canvasRef.current, dynamicCanvasRef.current, labelCanvasRef.current];
+    if (canvases.some((c) => !c) || size.w < 1 || size.h < 1) return;
+    const dpr = window.devicePixelRatio || 1;
+    for (const canvas of canvases) {
+      canvas!.width = Math.round(size.w * dpr);
+      canvas!.height = Math.round(size.h * dpr);
+    }
+    drawStaticLayer();
+    drawLabelLayer();
+    drawDynamicLayer();
+  }, [size.w, size.h]);
 
   useEffect(() => {
     if (framedRef.current || size.w < 80 || size.h < 80) return;
@@ -984,7 +1814,7 @@ export function MapView({
     applyCam();
   }, [toXY, size.w, size.h]);
 
-  function onWheel(e: React.WheelEvent) {
+  const onWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
     const rect = containerRef.current!.getBoundingClientRect();
     const mx = e.clientX - rect.left;
@@ -995,8 +1825,23 @@ export function MapView({
     const wx = (mx - c.x) / c.k;
     const wy = (my - c.y) / c.k;
     camRef.current = { k: nk, x: mx - wx * nk, y: my - wy * nk };
-    applyCam();
-  }
+    scheduleApplyCam();
+  }, []);
+
+  /**
+   * React attache les listeners `wheel` en passif par défaut (perf) — un
+   * `onWheel` React ne peut donc pas appeler `preventDefault()` (warning
+   * "Unable to preventDefault inside passive event listener invocation",
+   * et le zoom scrollerait la page en dessous). Un listener natif avec
+   * `{ passive: false }` est le seul moyen de bloquer le scroll par défaut
+   * tout en zoomant la carte.
+   */
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [onWheel]);
 
   function onPointerDown(e: React.PointerEvent) {
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
@@ -1016,7 +1861,7 @@ export function MapView({
       x: d.camX + dx,
       y: d.camY + dy,
     };
-    applyCam();
+    scheduleApplyCam();
   }
 
   function onPointerUp(e: React.PointerEvent) {
@@ -1102,6 +1947,20 @@ export function MapView({
     if (selectedArmyId == null || !onOrderMarch) return;
     e.preventDefault();
     const el = document.elementFromPoint(e.clientX, e.clientY);
+    // Un marqueur d'armée (le sien ou un ennemi) est rendu par-dessus le
+    // domaine et intercepte le clic en premier — sans ce cas, viser une
+    // armée (la sienne pour la garder sur place, une ennemie pour l'attaquer)
+    // ne trouvait aucun `data-unit-level="domaine"` en remontant le DOM et
+    // retombait sur le domaine le plus proche par distance, qui pouvait être
+    // celui de départ (marche vers soi-même : chemin vide, ordre ignoré).
+    const armyHit = el?.closest?.("[data-army-id]") as HTMLElement | null;
+    if (armyHit) {
+      const hitArmy = armies.find((a) => a.id === Number(armyHit.dataset.armyId));
+      if (hitArmy) {
+        onOrderMarch(selectedArmyId, hitArmy.domainId);
+        return;
+      }
+    }
     const domainHit = el?.closest?.(
       '[data-unit-id][data-unit-level="domaine"]',
     ) as HTMLElement | null;
@@ -1125,11 +1984,290 @@ export function MapView({
     if (best) onOrderMarch(selectedArmyId, best.id);
   }
 
+  /**
+   * Géométrie de tout ce qui ne dépend pas de `dayProgress` (terre, domaines,
+   * rivières, overlays, flèches de marche…) — construite en `Path2D` une
+   * seule fois ici, rejouée sur le canvas à chaque frame de caméra sans
+   * jamais reparser aucun `d`. Mêmes deps que l'ancien `staticMapLayer` SVG
+   * (voir historique) : en le mémoïsant à part des marqueurs d'armée (qui
+   * glissent en continu), le pan/zoom pendant la marche d'une armée ne
+   * reconstruit pas cette géométrie 20×/s pour rien.
+   */
+  const staticGeometry = useMemo<StaticGeometry>(() => {
+    const land = landPath ? new Path2D(landPath) : null;
+
+    const units: StaticGeometry["units"] = [];
+    for (const p of unitPaths) {
+      if (!p.d) continue;
+      const unitLevel = p.selectionLevel ?? level;
+      const selected = selection?.level === unitLevel && selection.id === p.id;
+      const highlighted = highlightId != null && p.id === highlightId;
+      const isProvinceChild = p.selectionLevel === "province";
+      const isDomainChild = p.selectionLevel === "domaine";
+      units.push({
+        path2d: new Path2D(p.d),
+        fill: p.fill,
+        fillOpacity: highlighted ? 1 : selected ? 0.95 : isProvinceChild || isDomainChild ? 0.9 : 0.85,
+        stroke: highlighted ? "#f5f0e6" : selected ? "#1a1510" : p.stroke,
+        strokeWidth: highlighted
+          ? 2.6
+          : selected
+            ? 1.8
+            : isProvinceChild
+              ? 1.15
+              : unitLevel === "royaume" ||
+                  unitLevel === "possession" ||
+                  unitLevel === "terrain" ||
+                  unitLevel === "economy" ||
+                  unitLevel === "opinion"
+                ? 1.25
+                : unitLevel === "province"
+                  ? 1.05
+                  : 0.55,
+      });
+    }
+
+    const occupiedHatchSpecs: PatternSpec[] = occupiedHatchPatterns.map(({ id, colorA, colorB }) => ({
+      id,
+      size: 14,
+      angleDeg: 45,
+      draw: drawOccupiedTile(colorA, colorB),
+    }));
+    const driftHatchSpecs: PatternSpec[] = driftHatchPatterns.map(({ id, color }) => ({
+      id,
+      size: 11,
+      angleDeg: 20,
+      draw: drawDriftTile(color),
+    }));
+
+    const cityMarkers: StaticGeometry["cityMarkers"] =
+      level === "domaine"
+        ? (world.cities || []).map((city) => {
+            const [x, y] = toXY(city.lon, city.lat);
+            const selected = selectedCity?.id === city.id;
+            const r = city.kind === "civitas" ? 2.4 : city.kind === "city" ? 1.7 : 1.35;
+            return {
+              x,
+              y,
+              r: selected ? r + 1.2 : r,
+              fill: selected
+                ? "#1a1510"
+                : city.kind === "civitas"
+                  ? "#3a2a18"
+                  : city.kind === "city"
+                    ? "#5a4030"
+                    : "#6a5545",
+              strokeWidth: selected ? 1.1 : 0.55,
+            };
+          })
+        : [];
+
+    return {
+      mapW,
+      mapH,
+      ocean: {
+        x: -mapW * 0.15,
+        y: -mapH * 0.15,
+        w: mapW * 1.3,
+        h: mapH * 1.3,
+        depth: { cx: mapW * 0.42, cy: mapH * 0.48, r: mapW * 0.85 },
+        atlantique: { x1: 0, y1: mapH * 0.4, x2: mapW * 0.55, y2: mapH * 0.45 },
+      },
+      land,
+      units,
+      hoverOutline: hoverOutline
+        ? { path2d: new Path2D(hoverOutline.d), fill: hoverOutline.fill, stroke: hoverOutline.stroke }
+        : null,
+      occupiedOverlays: occupiedOverlays.map((o) => ({ path2d: new Path2D(o.d), patternId: o.patternId })),
+      occupiedHatchSpecs,
+      enemyRealmBorderOverlays: enemyRealmBorderOverlays.map((o) => ({ path2d: new Path2D(o.d) })),
+      warGoalOverlays: warGoalOverlays.map((o) => ({ path2d: new Path2D(o.d) })),
+      siegeOverlays: siegeOverlays.map((o) => ({ path2d: new Path2D(o.d), color: o.color, opacity: o.opacity })),
+      driftOverlays: driftOverlays.map((o) => ({ path2d: new Path2D(o.d), patternId: o.patternId, color: o.color })),
+      driftHatchSpecs,
+      hillshade: hillshadeCanvas,
+      impassable: impassablePath ? { path2d: new Path2D(impassablePath) } : null,
+      rivers: riversPath ? new Path2D(riversPath) : null,
+      landOutline: land,
+      cityMarkers,
+      selectedKingdomOutline: selectedKingdomOutline
+        ? { path2d: new Path2D(selectedKingdomOutline.d), stroke: selectedKingdomOutline.stroke }
+        : null,
+      claimFocusOutline: claimFocusOutline
+        ? { path2d: new Path2D(claimFocusOutline.d), stroke: claimFocusOutline.stroke }
+        : null,
+      armyMoveArrows: armyMoveArrows.map((a) => {
+        const [c1, c2, c3] = a.headPoints;
+        return {
+          path2d: new Path2D(a.d),
+          head: new Path2D(a.head),
+          headCenter: [(c1[0] + c2[0] + c3[0]) / 3, (c1[1] + c2[1] + c3[1]) / 3] as [number, number],
+          color: a.color,
+          friendly: a.friendly,
+        };
+      }),
+      // Provinces : texte plat (rapide, nombreux). Realms : texte courbé,
+      // glyphe par glyphe le long de la courbe — nettement plus coûteux par
+      // libellé, mais il n'y en a jamais qu'une poignée (un par royaume).
+      labels: territoryLabels.map((l): LabelPaint => {
+        if (l.curveDs && l.curveDs.length > 0) {
+          return {
+            kind: "curved",
+            fontSize: l.fontSize,
+            lines: l.curveDs.map((d, i) => ({
+              glyphs: layoutCurvedText(d, l.lines[i] ?? "", l.fontSize),
+            })),
+          };
+        }
+        return {
+          kind: "flat",
+          lines: l.lines,
+          x: l.x ?? 0,
+          y: l.y ?? 0,
+          angleDeg: l.angle ?? 0,
+          fontSize: l.fontSize,
+        };
+      }),
+    };
+  }, [
+    mapW,
+    mapH,
+    landPath,
+    unitPaths,
+    level,
+    selection,
+    highlightId,
+    world,
+    toXY,
+    hoverOutline,
+    occupiedOverlays,
+    occupiedHatchPatterns,
+    warGoalOverlays,
+    enemyRealmBorderOverlays,
+    siegeOverlays,
+    driftOverlays,
+    driftHatchPatterns,
+    hillshadeCanvas,
+    impassablePath,
+    riversPath,
+    selectedCity,
+    selectedKingdomOutline,
+    claimFocusOutline,
+    armyMoveArrows,
+    territoryLabels,
+  ]);
+
+  useEffect(() => {
+    staticGeometryRef.current = staticGeometry;
+    drawStaticLayer();
+    drawLabelLayer();
+  }, [staticGeometry]);
+
+  /**
+   * Marqueurs d'armée — déclencheur séparé (`armyMarkers`/`selectedArmyId`),
+   * indépendant du reste du contenu : c'est ce qui change ~20×/s pendant
+   * qu'une armée marche (`dayProgress`), sans jamais devoir toucher au
+   * canvas statique.
+   */
+  useEffect(() => {
+    dynamicGeometryRef.current = { markers: armyMarkers, selectedArmyId };
+    drawDynamicLayer();
+  }, [armyMarkers, selectedArmyId]);
+
+  const anyArmyBattling = useMemo(
+    () => armyMarkers.some((m) => m.stance === "battling"),
+    [armyMarkers],
+  );
+
+  /**
+   * Pulsation `army-battle-pulse` (CSS à l'origine, `stroke-opacity` 0.55→1
+   * en boucle) : sur canvas, il faut une boucle `requestAnimationFrame`
+   * dédiée tant qu'au moins une armée se bat. Dépend du booléen dérivé
+   * `anyArmyBattling`, pas de `armyMarkers` lui-même (qui change de
+   * référence à chaque tick de `dayProgress`) — sinon cet effet
+   * redémarrerait la boucle en boucle pendant toute marche d'armée, pas
+   * seulement pendant un combat.
+   */
+  useEffect(() => {
+    if (!anyArmyBattling) return;
+    let raf = 0;
+    const loop = () => {
+      drawDynamicLayer();
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [anyArmyBattling]);
+
+  /**
+   * Couche SVG invisible posée par-dessus le canvas — uniquement pour que
+   * les clics/survols existants (`data-unit-id`, `data-city-id`,
+   * `elementFromPoint` dans `onPointerUp`/`onContextMenu`) continuent de
+   * fonctionner sans réécriture : `fill:none;stroke:none` + `pointer-events:
+   * all` pour rester cliquable sans rien peindre. Ordre conservé identique
+   * à l'ancien z-index de clic (domaines puis villes, avant les marqueurs
+   * d'armée). Ne dépend plus de `selection`/`highlightId`/`selectedCity`
+   * (qui n'affectaient que l'apparence, désormais gérée par le canvas) —
+   * moins de dépendances que l'ancien bloc combiné, donc encore moins de
+   * réconciliation.
+   */
+  const hitLayer = useMemo(
+    () => (
+      <>
+        {unitPaths.map((p) => {
+          if (!p.d) return null;
+          const unitLevel = p.selectionLevel ?? level;
+          return (
+            <path
+              key={`${unitLevel}-${p.id}`}
+              data-unit-id={p.id}
+              data-unit-level={unitLevel}
+              d={p.d}
+              fill="none"
+              stroke="none"
+              style={{ cursor: "pointer", pointerEvents: "all" }}
+              onMouseEnter={() => {
+                if (!onHover) return;
+                if (unitLevel === "domaine") {
+                  const d = world.domaines.find((x) => x.id === p.id) ?? world.domaines[p.id];
+                  onHover(d?.possessionId ?? null);
+                  return;
+                }
+                if (unitLevel === "possession") onHover(p.id);
+              }}
+              onMouseLeave={() => onHover?.(null)}
+            />
+          );
+        })}
+        {level === "domaine" &&
+          cityMarkers.map(({ city, x, y }) => {
+            const r = city.kind === "civitas" ? 2.4 : city.kind === "city" ? 1.7 : 1.35;
+            return (
+              <circle
+                key={city.id}
+                data-city-id={city.id}
+                cx={x}
+                cy={y}
+                r={r + 1.2}
+                fill="none"
+                stroke="none"
+                style={{ cursor: "pointer", pointerEvents: "all" }}
+              />
+            );
+          })}
+      </>
+    ),
+    [unitPaths, level, onHover, world, cityMarkers],
+  );
+
+  // Les libellés de territoire sont désormais peints sur `labelCanvasRef`
+  // (voir `staticGeometry.labels` + `drawLabelLayer`/`paintLabels`) — plus
+  // de <text>/<textPath> SVG ici.
+
   return (
     <div
       ref={containerRef}
       className="map2d"
-      onWheel={onWheel}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -1138,506 +2276,36 @@ export function MapView({
         dragRef.current = null;
       }}
     >
+      {/*
+        Trois canvases empilés (ordre DOM = ordre de peinture, cf. App.css
+        `.map2d-canvas { position:absolute; inset:0 }`) : terrain/domaines
+        (redessiné sur changement de contenu/caméra) → marqueurs d'armée
+        (redessiné en plus à chaque tick de `dayProgress`, cadence propre) →
+        libellés (au-dessus des marqueurs, même déclencheurs que le
+        terrain). Le SVG par-dessus ne porte plus que des formes invisibles
+        pour les clics/survols.
+      */}
+      <canvas ref={canvasRef} className="map2d-canvas" />
+      <canvas ref={dynamicCanvasRef} className="map2d-canvas" />
+      <canvas ref={labelCanvasRef} className="map2d-canvas" />
       <svg width={size.w} height={size.h} className="map2d-svg" style={{ display: "block" }}>
-        <defs>
-          <radialGradient
-            id="ocean-depth"
-            gradientUnits="userSpaceOnUse"
-            cx={mapW * 0.42}
-            cy={mapH * 0.48}
-            r={mapW * 0.85}
-          >
-            <stop offset="0%" stopColor="#4a7382" />
-            <stop offset="28%" stopColor="#3a5f6e" />
-            <stop offset="58%" stopColor="#2a4a58" />
-            <stop offset="100%" stopColor="#152832" />
-          </radialGradient>
-          <linearGradient
-            id="ocean-atlantique"
-            gradientUnits="userSpaceOnUse"
-            x1={0}
-            y1={mapH * 0.4}
-            x2={mapW * 0.55}
-            y2={mapH * 0.45}
-          >
-            <stop offset="0%" stopColor="#101f28" stopOpacity="0.75" />
-            <stop offset="55%" stopColor="#1a3340" stopOpacity="0.25" />
-            <stop offset="100%" stopColor="#2a4a58" stopOpacity="0" />
-          </linearGradient>
-          <pattern
-            id="impassable-hatch"
-            patternUnits="userSpaceOnUse"
-            width="7"
-            height="7"
-            patternTransform="rotate(35)"
-          >
-            <rect width="7" height="7" fill="#141210" />
-            <line x1="0" y1="0" x2="0" y2="7" stroke="#3a3632" strokeWidth="2" />
-          </pattern>
-          {occupiedHatchPatterns.map(({ id, colorA, colorB }) => (
-            <pattern
-              key={id}
-              id={id}
-              patternUnits="userSpaceOnUse"
-              width="14"
-              height="14"
-              patternTransform="rotate(45)"
-            >
-              <rect width="14" height="14" fill={colorB} fillOpacity={0.85} />
-              <rect width="7" height="14" fill={colorA} fillOpacity={0.85} />
-            </pattern>
-          ))}
-          {driftHatchPatterns.map(({ id, color }) => (
-            <pattern
-              key={id}
-              id={id}
-              patternUnits="userSpaceOnUse"
-              width="11"
-              height="11"
-              patternTransform="rotate(20)"
-            >
-              <rect width="11" height="11" fill={color} fillOpacity={0.1} />
-              <line
-                x1="0"
-                y1="0"
-                x2="0"
-                y2="11"
-                stroke={color}
-                strokeWidth="2.5"
-                strokeOpacity={0.65}
-                strokeDasharray="2 3"
-              />
-            </pattern>
-          ))}
-          {landPath && (
-            <clipPath id="land-clip">
-              <path d={landPath} />
-            </clipPath>
-          )}
-        </defs>
-        <rect width={size.w} height={size.h} fill="#152832" />
         <g ref={worldGroupRef}>
-          <rect
-            x={-mapW * 0.15}
-            y={-mapH * 0.15}
-            width={mapW * 1.3}
-            height={mapH * 1.3}
-            fill="url(#ocean-depth)"
-          />
-          <rect
-            x={-mapW * 0.15}
-            y={-mapH * 0.15}
-            width={mapW * 1.3}
-            height={mapH * 1.3}
-            fill="url(#ocean-atlantique)"
-          />
-          {landPath && <path d={landPath} fill={LAND_COLOR} stroke="none" />}
-          <g clipPath={landPath ? "url(#land-clip)" : undefined}>
-            {unitPaths.map((p) => {
-              if (!p.d) return null;
-              const unitLevel = p.selectionLevel ?? level;
-              const selected = selection?.level === unitLevel && selection.id === p.id;
-              const highlighted = highlightId != null && p.id === highlightId;
-              const isProvinceChild = p.selectionLevel === "province";
-              const isDomainChild = p.selectionLevel === "domaine";
-              return (
-                <path
-                  key={`${unitLevel}-${p.id}`}
-                  data-unit-id={p.id}
-                  data-unit-level={unitLevel}
-                  d={p.d}
-                  fill={p.fill}
-                  fillOpacity={
-                    highlighted
-                      ? 1
-                      : selected
-                        ? 0.95
-                        : isProvinceChild || isDomainChild
-                          ? 0.9
-                          : 0.85
-                  }
-                  stroke={highlighted ? "#f5f0e6" : selected ? "#1a1510" : p.stroke}
-                  strokeWidth={
-                    highlighted
-                      ? 2.6
-                      : selected
-                        ? 1.8
-                        : isProvinceChild
-                          ? 1.15
-                          : unitLevel === "royaume" ||
-                              unitLevel === "possession" ||
-                              unitLevel === "terrain" ||
-                              unitLevel === "economy" ||
-                              unitLevel === "opinion"
-                            ? 1.25
-                            : unitLevel === "province"
-                              ? 1.05
-                              : 0.55
-                  }
-                  strokeLinejoin="round"
-                  style={{ cursor: "pointer" }}
-                  onMouseEnter={() => {
-                    if (!onHover) return;
-                    if (unitLevel === "domaine") {
-                      const d =
-                        world.domaines.find((x) => x.id === p.id) ?? world.domaines[p.id];
-                      onHover(d?.possessionId ?? null);
-                      return;
-                    }
-                    if (unitLevel === "possession") onHover(p.id);
-                  }}
-                  onMouseLeave={() => onHover?.(null)}
-                />
-              );
-            })}
-            {hoverOutline && (
-              <path
-                d={hoverOutline.d}
-                fill={hoverOutline.fill}
-                fillOpacity={0.28}
-                stroke="#f5f0e6"
-                strokeWidth={2.8}
-                strokeLinejoin="round"
-                style={{ pointerEvents: "none" }}
-              />
-            )}
-            {occupiedOverlays.map((o) => (
-              <path
-                key={o.key}
-                d={o.d}
-                fill={`url(#${o.patternId})`}
-                stroke="none"
-                style={{ pointerEvents: "none" }}
-              />
-            ))}
-            {warGoalOverlays.map((o) => (
-              <path
-                key={o.key}
-                d={o.d}
-                fill="none"
-                stroke="#e8b93d"
-                strokeWidth={1.6}
-                strokeOpacity={0.9}
-                strokeDasharray="5 3"
-                strokeLinejoin="round"
-                style={{ pointerEvents: "none" }}
-              />
-            ))}
-            {siegeOverlays.map((o) => (
-              <g key={`siege-${o.armyId}-${o.domainId}`} style={{ pointerEvents: "none" }}>
-                <path d={o.d} fill={o.color} fillOpacity={o.opacity} stroke="none" />
-                <path
-                  d={o.d}
-                  fill="none"
-                  stroke={o.color}
-                  strokeWidth={1.4}
-                  strokeOpacity={0.85}
-                  strokeDasharray="4 3"
-                  strokeLinejoin="round"
-                />
-              </g>
-            ))}
-            {driftOverlays.map((o) => (
-              <g key={`drift-${o.key}`} style={{ pointerEvents: "none" }}>
-                <path d={o.d} fill={`url(#${o.patternId})`} stroke="none" />
-                <path
-                  d={o.d}
-                  fill="none"
-                  stroke={o.color}
-                  strokeWidth={1.6}
-                  strokeOpacity={0.7}
-                  strokeDasharray="1 4"
-                  strokeLinejoin="round"
-                />
-              </g>
-            ))}
-          </g>
-          {hillshadeUrl && (
-            <image
-              href={hillshadeUrl}
-              x={0}
-              y={0}
-              width={mapW}
-              height={mapH}
-              preserveAspectRatio="none"
-              clipPath={landPath ? "url(#land-clip)" : undefined}
-              style={{ mixBlendMode: "multiply", opacity: 0.32, pointerEvents: "none" }}
-            />
-          )}
-          {impassablePath && (
-            <path
-              d={impassablePath}
-              fill="url(#impassable-hatch)"
-              stroke="#0a0908"
-              strokeWidth={0.8}
-              strokeLinejoin="round"
-              pointerEvents="none"
-            />
-          )}
-          {riversPath && (
-            <path
-              d={riversPath}
+          {hitLayer}
+          {/* Peinture réelle sur dynamicCanvasRef (paintArmyMarkers) — ceci n'est plus qu'une zone de clic invisible, généreuse, alignée sur le rectangle visible. */}
+          {armyMarkers.map((m) => (
+            <rect
+              key={`army-hit-${m.id}`}
+              data-army-id={m.id}
+              x={-7}
+              y={-9}
+              width={14}
+              height={18}
+              transform={`translate(${m.x.toFixed(2)} ${m.y.toFixed(2)}) rotate(${m.angleDeg.toFixed(1)})`}
               fill="none"
-              stroke="#2a6a8a"
-              strokeWidth={1.35}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              opacity={0.95}
-              vectorEffect="non-scaling-stroke"
-              pointerEvents="none"
+              stroke="none"
+              style={{ cursor: "pointer", pointerEvents: "all" }}
             />
-          )}
-          {landPath && (
-            <path
-              d={landPath}
-              fill="none"
-              stroke="rgba(18, 28, 36, 0.85)"
-              strokeWidth={1.2}
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-              pointerEvents="none"
-            />
-          )}
-          {level === "domaine" &&
-            cityMarkers.map(({ city, x, y }) => {
-            const selected = selectedCity?.id === city.id;
-            const r = city.kind === "civitas" ? 2.4 : city.kind === "city" ? 1.7 : 1.35;
-            return (
-              <circle
-                key={city.id}
-                data-city-id={city.id}
-                cx={x}
-                cy={y}
-                r={selected ? r + 1.2 : r}
-                fill={
-                  selected
-                    ? "#1a1510"
-                    : city.kind === "civitas"
-                      ? "#3a2a18"
-                      : city.kind === "city"
-                        ? "#5a4030"
-                        : "#6a5545"
-                }
-                stroke="#efe6d4"
-                strokeWidth={selected ? 1.1 : 0.55}
-                vectorEffect="non-scaling-stroke"
-                style={{ cursor: "pointer" }}
-              />
-            );
-          })}
-          {selectedKingdomOutline && (
-            <path
-              d={selectedKingdomOutline.d}
-              fill="none"
-              stroke={selectedKingdomOutline.stroke}
-              strokeWidth={2.4}
-              strokeLinejoin="round"
-              strokeLinecap="round"
-              opacity={0.92}
-              pointerEvents="none"
-            />
-          )}
-          {claimFocusOutline && (
-            <path
-              d={claimFocusOutline.d}
-              fill="none"
-              stroke={claimFocusOutline.stroke}
-              strokeWidth={3.2}
-              strokeLinejoin="round"
-              strokeLinecap="round"
-              opacity={0.95}
-              pointerEvents="none"
-            />
-          )}
-          {armyMoveArrows.map((a) => (
-            <g key={`arrow-${a.id}`} style={{ pointerEvents: "none" }}>
-              <path
-                d={a.d}
-                fill="none"
-                stroke="#f5f0e6"
-                strokeOpacity={0.9}
-                strokeWidth={a.friendly ? 3 : 2.4}
-                strokeDasharray={a.friendly ? undefined : "3 2.5"}
-                strokeLinejoin="round"
-                strokeLinecap="round"
-                vectorEffect="non-scaling-stroke"
-              />
-              <path
-                d={a.d}
-                fill="none"
-                stroke={a.color}
-                strokeWidth={a.friendly ? 1.6 : 1.1}
-                strokeOpacity={a.friendly ? 0.95 : 0.75}
-                strokeDasharray={a.friendly ? undefined : "3 2.5"}
-                strokeLinejoin="round"
-                strokeLinecap="round"
-                vectorEffect="non-scaling-stroke"
-              />
-              <path d={a.head} fill="#f5f0e6" fillOpacity={0.9} stroke="none" />
-              <path
-                d={a.head}
-                fill={a.color}
-                fillOpacity={a.friendly ? 0.95 : 0.75}
-                stroke="none"
-                transform={`translate(0 0) scale(0.72)`}
-                style={{ transformBox: "fill-box", transformOrigin: "center" }}
-              />
-            </g>
           ))}
-          {armyMarkers.map((m) => {
-            const selected = selectedArmyId === m.id;
-            // w = profondeur (axe de marche, pointe vers l’avant une fois orienté),
-            // h = largeur (grand côté, porte les diagonales/points) — face avant vers la marche.
-            const w = 8.4;
-            const h = 12;
-            const tier = armySizeTier(m.troops);
-            // Glyphe en coordonnées locales (centré sur l’origine) — le
-            // groupe est translaté/orienté, pas les points eux-mêmes.
-            const glyph = armyGlyphParts(tier, -w / 2, -h / 2, w, h);
-            return (
-              <g key={`army-${m.id}`}>
-                <g
-                  data-army-id={m.id}
-                  className="army-marker-group"
-                  transform={`translate(${m.x.toFixed(2)} ${m.y.toFixed(2)}) rotate(${m.angleDeg.toFixed(1)})`}
-                  style={{ cursor: "pointer" }}
-                >
-                  {selected && (
-                    <rect
-                      x={-w / 2 - 2.5}
-                      y={-h / 2 - 2.5}
-                      width={w + 5}
-                      height={h + 5}
-                      fill="none"
-                      stroke="#f5f0e6"
-                      strokeWidth={1.2}
-                      vectorEffect="non-scaling-stroke"
-                    />
-                  )}
-                  <rect
-                    x={-w / 2}
-                    y={-h / 2}
-                    width={w}
-                    height={h}
-                    fill={m.color}
-                    stroke={m.stance === "battling" ? "#c23b2a" : "#1a1510"}
-                    strokeWidth={m.stance === "battling" ? 2.2 : 1}
-                    strokeDasharray={m.stance === "sieging" ? "2 1.5" : undefined}
-                    className={m.stance === "battling" ? "army-marker-battling" : undefined}
-                    vectorEffect="non-scaling-stroke"
-                  />
-                  {glyph.lines.map(([x1, y1, x2, y2], i) => (
-                    <line
-                      key={i}
-                      x1={x1}
-                      y1={y1}
-                      x2={x2}
-                      y2={y2}
-                      stroke="#1a1510"
-                      strokeWidth={0.8}
-                      vectorEffect="non-scaling-stroke"
-                    />
-                  ))}
-                  {glyph.dots.map(([dx, dy], i) => (
-                    <circle key={i} cx={dx} cy={dy} r={0.75} fill="#1a1510" />
-                  ))}
-                </g>
-                <g
-                  className="army-marker-label"
-                  transform={`translate(${m.x.toFixed(2)} ${m.y.toFixed(2)})`}
-                >
-                  <text
-                    x={0}
-                    y={h / 2 + 6.5}
-                    textAnchor="middle"
-                    fontSize={5.5}
-                    fill={m.labelColor}
-                    stroke="#1a1510"
-                    strokeWidth={0.6}
-                    paintOrder="stroke fill"
-                    style={{ pointerEvents: "none", userSelect: "none" }}
-                  >
-                    {formatCount(m.troops)}
-                  </text>
-                </g>
-              </g>
-            );
-          })}
-          {territoryLabels.flatMap((l) =>
-            (l.curveDs || []).map((d, i) => (
-              <path
-                key={`curve-${l.key}-${i}`}
-                id={`label-curve-${l.key}-${i}`}
-                d={d}
-                fill="none"
-                stroke="none"
-                pointerEvents="none"
-              />
-            )),
-          )}
-          {territoryLabels.flatMap((l) => {
-            // Provinces : texte plat (rapide). Realms : textPath courbé.
-            if (l.curveDs && l.curveDs.length > 0) {
-              return l.lines.map((line, i) => (
-                <text
-                  key={`label-${l.key}-${i}`}
-                  fontSize={l.fontSize}
-                  fontWeight={700}
-                  fill="#1a1510"
-                  stroke="rgba(245, 236, 220, 0.55)"
-                  strokeWidth={1.1}
-                  strokeLinejoin="round"
-                  paintOrder="stroke fill"
-                  style={{
-                    pointerEvents: "none",
-                    userSelect: "none",
-                    fontFamily:
-                      "Palatino, 'Palatino Linotype', 'Book Antiqua', 'Times New Roman', serif",
-                  }}
-                >
-                  <textPath
-                    href={`#label-curve-${l.key}-${i}`}
-                    startOffset="50%"
-                    textAnchor="middle"
-                  >
-                    {line}
-                  </textPath>
-                </text>
-              ));
-            }
-            const x = l.x ?? 0;
-            const y = l.y ?? 0;
-            const ang = l.angle ?? 0;
-            const lineH = l.fontSize * 1.05;
-            const startY = y - ((l.lines.length - 1) * lineH) / 2;
-            return l.lines.map((line, i) => (
-              <text
-                key={`label-${l.key}-${i}`}
-                x={x}
-                y={startY + i * lineH}
-                textAnchor="middle"
-                dominantBaseline="middle"
-                transform={
-                  Math.abs(ang) > 0.5 ? `rotate(${ang.toFixed(1)} ${x.toFixed(1)} ${y.toFixed(1)})` : undefined
-                }
-                fontSize={l.fontSize}
-                fontWeight={600}
-                fill="#1a1510"
-                stroke="rgba(245, 236, 220, 0.5)"
-                strokeWidth={0.9}
-                strokeLinejoin="round"
-                paintOrder="stroke fill"
-                style={{
-                  pointerEvents: "none",
-                  userSelect: "none",
-                  fontFamily:
-                    "Palatino, 'Palatino Linotype', 'Book Antiqua', 'Times New Roman', serif",
-                }}
-              >
-                {line}
-              </text>
-            ));
-          })}
         </g>
       </svg>
       {selectedCity && (

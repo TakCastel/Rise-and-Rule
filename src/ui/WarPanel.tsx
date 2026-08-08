@@ -2,6 +2,26 @@ import { domainById, warSideOf } from "../game/army";
 import { canPressDemands, canRequestWhitePeace, warScorePercent } from "../game/army-actions";
 import type { GameState, WarState } from "../game/types";
 
+/** Motif de la guerre, en clair, pour l'onglet Guerre — pourquoi on se bat. */
+function warCauseLabel(game: GameState, war: WarState): string {
+  const cb = war.casusBelli ?? "claim_province";
+  if (cb === "vassalize") return "Forced submission — losing makes you their vassal";
+  if (cb === "depose") return "Bid to depose their liege";
+  if (cb === "independence") return "Bid for independence";
+  if (cb === "conquest") return "Conquest";
+
+  if (war.claimTitleId) {
+    const title = (game.titles || []).find((t) => t.id === war.claimTitleId);
+    if (title) return `Claim on ${title.name}`;
+  }
+  if (war.warGoalDomainIds?.length) {
+    return war.warGoalDomainIds.length === 1
+      ? "Claim on a domain"
+      : `Claim on ${war.warGoalDomainIds.length} domains`;
+  }
+  return "Territorial claim";
+}
+
 function warStatusLine(game: GameState, war: WarState): string {
   const armies = game.armies.filter((a) => a.warId === war.id);
   if (!armies.length) return "No armies raised yet.";
@@ -31,6 +51,9 @@ function warStatusLine(game: GameState, war: WarState): string {
   const idle = armies.filter((a) => a.stance === "idle").length;
   if (idle) parts.push(`${idle} awaiting orders`);
 
+  const routing = armies.filter((a) => a.stance === "routing").length;
+  if (routing) parts.push(`${routing} routed and fleeing`);
+
   return parts.length ? parts.join(" · ") : "Armies in the field.";
 }
 
@@ -52,6 +75,9 @@ export function WarPanel({
   onPressDemands: (warId: number) => void;
 }) {
   const playerId = game.playerId;
+  // Une armée déjà levée (pour n'importe laquelle de mes guerres) engage
+  // déjà tous mes fronts à la fois — pas besoin d'en relever une par guerre.
+  const hasAnyArmy = game.armies.some((a) => a.ownerId === playerId);
   const allWars =
     playerId == null
       ? []
@@ -72,10 +98,9 @@ export function WarPanel({
       </div>
       {wars.map((w) => {
         const enemyName = w.attackerId === playerId ? w.defenderName : w.attackerName;
-        const myArmies = game.armies.filter((a) => a.warId === w.id && a.ownerId === playerId);
-        const press = canPressDemands(w, playerId!);
+        const press = canPressDemands(game, w, playerId!);
         const peace = canRequestWhitePeace(game, w, playerId!);
-        const score = warScorePercent(w, playerId!);
+        const score = warScorePercent(game, w, playerId!);
         const isBattling = game.armies.some((a) => a.warId === w.id && a.stance === "battling");
         const isFocused = focusWarId === w.id;
 
@@ -85,6 +110,7 @@ export function WarPanel({
             className={`war-panel-card${isBattling ? " is-battling" : ""}${isFocused ? " is-focused" : ""}`}
           >
             <div className="war-panel-title">vs {enemyName}</div>
+            <div className="war-panel-cause">{warCauseLabel(game, w)}</div>
             <div className="war-panel-status">{warStatusLine(game, w)}</div>
             <div className="war-panel-score">
               <div className="war-panel-score-mid" />
@@ -102,7 +128,7 @@ export function WarPanel({
               {score}%
             </div>
             <div className="war-panel-actions">
-              {!myArmies.length && (
+              {!hasAnyArmy && (
                 <button type="button" onClick={() => onRaiseLevies(w.id)}>
                   Raise levies
                 </button>

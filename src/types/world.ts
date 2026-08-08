@@ -76,6 +76,9 @@ export interface Royaume {
 /** Rang dans la hiérarchie de facto : roi → chef de province → seigneur de domaine. */
 export type PossessionRank = "king" | "vassal" | "subvassal" | "chief";
 
+/** Politique du royaume : concentrer les efforts sur un axe boosté aux dépens des deux autres. */
+export type PossessionFocus = "economy" | "war" | "prestige";
+
 /**
  * Possession de facto (~486).
  * Hiérarchie (3 niveaux max) :
@@ -127,6 +130,8 @@ export interface Possession {
   claims?: { titleId: string; year: number }[];
   /** Ids de domaines revendiqués (casus belli unitaire). */
   domainClaims?: number[];
+  /** Politique choisie : `undefined` = équilibré, sinon bonus à cet axe + malus aux deux autres. */
+  focus?: PossessionFocus;
 }
 
 /** Types de terrain — décorrélés des royaumes / possessions. */
@@ -183,6 +188,7 @@ export type LevelName =
   | "economy"
   | "opinion"
   | "alliance"
+  | "power"
   | "war";
 
 export type Selection = { level: LevelName; id: number } | null;

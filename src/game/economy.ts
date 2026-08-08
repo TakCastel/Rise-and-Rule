@@ -1,5 +1,6 @@
 import type { Domaine, Possession, PossessionRank, WorldData } from "../types/world";
 import { debtInterest, demesneEfficiency } from "./demesne";
+import { economyFocusMultiplier, prestigeFocusMultiplier } from "./focus";
 
 /**
  * Revenu mensuel d’un domaine (or) — échelle basse (~486).
@@ -39,7 +40,7 @@ export function possessionMonthlyIncome(
     if (d) total += domainMonthlyIncome(d);
   }
   const eff = demesneEfficiency(p);
-  return Math.round(total * eff * 10) / 10;
+  return Math.round(total * eff * economyFocusMultiplier(p) * 10) / 10;
 }
 
 function realmDomainCount(world: WorldData, p: Possession): number {
@@ -67,7 +68,7 @@ export function possessionMonthlyPrestige(
       : (p.domaines || []).length;
   const base = Math.max(0.5, Math.round(domainCount * 0.75 * 10) / 10);
   const soft = 0.5 + 0.5 * Math.max(0, demesneEfficiency(p));
-  return Math.round(base * soft * 10) / 10;
+  return Math.round(base * soft * prestigeFocusMultiplier(p) * 10) / 10;
 }
 
 export interface IncomeBreakdown {
@@ -104,7 +105,7 @@ export function possessionIncomeBreakdown(
   domains.sort((a, b) => b.income - a.income);
   const efficiency = demesneEfficiency(p);
   const gross = Math.round(demesne * 10) / 10;
-  const total = Math.round(demesne * efficiency * 10) / 10;
+  const total = Math.round(demesne * efficiency * economyFocusMultiplier(p) * 10) / 10;
   const interest = debtInterest(p.gold ?? 0);
   const net = Math.round((total - interest) * 10) / 10;
   return {

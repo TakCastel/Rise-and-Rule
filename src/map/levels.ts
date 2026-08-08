@@ -1,5 +1,8 @@
+import { getAllyIds } from "../game/alliance";
+import type { Army } from "../game/army";
 import { domainMonthlyIncome } from "../game/economy";
 import { getOpinion } from "../game/opinion";
+import { possessionPower } from "../game/power";
 import { controlsDomain, realmDisplayName, type Title } from "../game/titles";
 import type { Alliance } from "../game/types";
 import { getTopLiege } from "../game/war";
@@ -673,7 +676,9 @@ export function getProvinceUnits(world: WorldData): RenderUnit[] {
     .filter((d) => d.royaumeId == null)
     .map((d) => {
       const u = isSeaUnit(d) ? toRender(d, SEA_COLOR) : toRender(d, LAND_COLOR);
-      if (!isSeaUnit(d)) u.colorSecondary = LAND_COLOR;
+      // Mer : contour = couleur de fond ⇒ invisible (pas de liseré maritime,
+      // ni entre deux cellules maritimes ni à la côte).
+      u.colorSecondary = isSeaUnit(d) ? SEA_COLOR : LAND_COLOR;
       u.selectionLevel = "domaine";
       return u;
     });
@@ -711,7 +716,9 @@ export function getKingdomUnits(world: WorldData): RenderUnit[] {
     .filter((d) => d.royaumeId == null)
     .map((d) => {
       const u = isSeaUnit(d) ? toRender(d, SEA_COLOR) : toRender(d, LAND_COLOR);
-      if (!isSeaUnit(d)) u.colorSecondary = LAND_COLOR;
+      // Mer : contour = couleur de fond ⇒ invisible (pas de liseré maritime,
+      // ni entre deux cellules maritimes ni à la côte).
+      u.colorSecondary = isSeaUnit(d) ? SEA_COLOR : LAND_COLOR;
       u.selectionLevel = "domaine";
       return u;
     });
@@ -835,7 +842,9 @@ export function getPossessionUnits(
     .filter((d) => !heldIds.has(d.id))
     .map((d) => {
       const u = isSeaUnit(d) ? toRender(d, SEA_COLOR) : toRender(d, LAND_COLOR);
-      if (!isSeaUnit(d)) u.colorSecondary = LAND_COLOR;
+      // Mer : contour = couleur de fond ⇒ invisible (pas de liseré maritime,
+      // ni entre deux cellules maritimes ni à la côte).
+      u.colorSecondary = isSeaUnit(d) ? SEA_COLOR : LAND_COLOR;
       u.selectionLevel = "domaine";
       return u;
     });
@@ -851,6 +860,8 @@ export function getUnits(
     opinions?: Record<string, number>;
     titles?: Title[];
     alliances?: Alliance[];
+    allianceEnemyIds?: number[];
+    armies?: Army[];
   },
 ): RenderUnit[] {
   if (level === "royaume") return getKingdomUnits(world);
@@ -862,7 +873,10 @@ export function getUnits(
     return getOpinionUnits(world, opts?.playerId, opts?.opinions, opts?.titles);
   }
   if (level === "alliance") {
-    return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles);
+    return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles, opts?.allianceEnemyIds);
+  }
+  if (level === "power") {
+    return getPowerUnits(world, opts?.opinions, opts?.armies, opts?.titles);
   }
   return getDomainUnits(world);
 }
@@ -897,6 +911,8 @@ export function getTerrainUnits(world: WorldData): RenderUnit[] {
     const type = d.terrainType;
     const color = type ? TERRAIN_PALETTE[type] : LAND_COLOR;
     const u = toRender(d, color);
+    // Mer : contour = couleur de fond, pas un ton auto-dérivé (cf. plus haut).
+    if (isSeaUnit(d)) u.colorSecondary = SEA_COLOR;
     u.selectionLevel = "domaine";
     return u;
   });
@@ -918,17 +934,9 @@ export function getDomainsOfTerrain(world: WorldData, terrainId: number): Render
     });
 }
 
-/** Couleur progression économique 0–100 (froid → chaud). */
-export function developmentColor(score: number): string {
+/** Interpole une valeur 0–100 le long d'une rampe de teintes RGB à paliers égaux. */
+function rampColor(score: number, stops: [number, number, number][]): string {
   const t = Math.max(0, Math.min(100, score)) / 100;
-  // bas: ardoise froide → milieu ambre → haut or chaud
-  const stops: [number, number, number][] = [
-    [45, 52, 64], // 0
-    [58, 78, 110], // 25
-    [120, 110, 70], // 50
-    [180, 130, 50], // 75
-    [220, 170, 55], // 100
-  ];
   const x = t * (stops.length - 1);
   const i = Math.min(stops.length - 2, Math.floor(x));
   const f = x - i;
@@ -940,6 +948,34 @@ export function developmentColor(score: number): string {
   return toHex(r, g, bl);
 }
 
+/** Couleur progression économique 0–100 (rose pâle → vert vif). */
+export function developmentColor(score: number): string {
+  // bas: rose pâle → mauve/tan sourd (transition neutre) → haut vert vif.
+  return rampColor(score, [
+    [230, 175, 195], // 0
+    [215, 165, 165], // 25
+    [180, 170, 130], // 50
+    [130, 175, 100], // 75
+    [80, 165, 90], // 100
+  ]);
+}
+
+/**
+ * Couleur vue Power 0–100 (ardoise froide → or chaud) — délibérément distincte
+ * du dégradé Economy (rose → vert) pour que les deux vues restent
+ * identifiables au premier coup d'œil, même si les deux mesurent une forme de
+ * « niveau » 0–100.
+ */
+export function powerColor(score: number): string {
+  return rampColor(score, [
+    [45, 52, 64], // 0
+    [58, 78, 110], // 25
+    [120, 110, 70], // 50
+    [180, 130, 50], // 75
+    [220, 170, 55], // 100
+  ]);
+}
+
 /**
  * Economy = chaque domaine coloré par development (0–100).
  * Indépendant de la politique.
@@ -948,6 +984,8 @@ export function getEconomyUnits(world: WorldData): RenderUnit[] {
   return world.domaines.map((d) => {
     const color = isSeaUnit(d) ? SEA_COLOR : developmentColor(d.development ?? 0);
     const u = toRender(d, color);
+    // Mer : contour = couleur de fond, pas un ton auto-dérivé (cf. plus haut).
+    if (isSeaUnit(d)) u.colorSecondary = SEA_COLOR;
     u.selectionLevel = "domaine";
     return u;
   });
@@ -1040,73 +1078,135 @@ export function getOpinionUnits(
     .filter((d) => !heldIds.has(d.id))
     .map((d) => {
       const u = isSeaUnit(d) ? toRender(d, SEA_COLOR) : toRender(d, LAND_COLOR);
-      if (!isSeaUnit(d)) u.colorSecondary = LAND_COLOR;
+      // Mer : contour = couleur de fond ⇒ invisible (pas de liseré maritime,
+      // ni entre deux cellules maritimes ni à la côte).
+      u.colorSecondary = isSeaUnit(d) ? SEA_COLOR : LAND_COLOR;
       u.selectionLevel = "domaine";
       return u;
     });
   return [...units, ...solos];
 }
 
-/** Vue Alliances — aucune alliance (indépendant). */
-export const ALLIANCE_NEUTRAL_COLOR = "#8a8172";
-
 /**
- * Couleur d’un bloc allié — angle doré (137.508°) pour un maximum de
- * distinction visuelle entre blocs consécutifs, quel que soit leur nombre.
+ * Vue Puissance : chaque roi/chef indépendant coloré selon sa force militaire
+ * (réserve de levées + armées déjà levées, cf. `possessionPower`) relative à
+ * la puissance la plus élevée du monde en jeu, ramenée sur une échelle 0–100
+ * (100 = la puissance la plus forte actuellement). Même dégradé que la vue
+ * Economy — indépendant de la politique, une pure photo des rapports de force.
  */
-function allianceClusterColor(index: number): string {
-  const hue = (index * 137.508) % 360;
-  const sat = 0.6;
-  const light = index % 2 === 0 ? 0.5 : 0.38;
-  return toHex(...hslToRgb(hue, sat, light));
+export function getPowerUnits(
+  world: WorldData,
+  opinions: Record<string, number> | undefined,
+  armies: Army[] | undefined,
+  titles?: Title[],
+): RenderUnit[] {
+  const list = (world.possessions || []).filter(
+    (p) => p.rank === "king" || p.rank === "chief",
+  );
+
+  const powers = new Map<number, number>();
+  let maxPower = 0;
+  for (const p of list) {
+    const power = possessionPower(world, p, opinions, armies);
+    powers.set(p.id, power);
+    if (power > maxPower) maxPower = power;
+  }
+
+  const heldIds = new Set<number>();
+  const units = list
+    .map((p) => {
+      let boundary: [number, number][][];
+      let labelName: string;
+      if (p.rank === "king") {
+        const domainIds = getRealmDomainIds(world, p.id);
+        if (!domainIds.length) return null;
+        for (const id of domainIds) heldIds.add(id);
+        boundary = getRealmBoundary(world, p.id);
+        if (!boundary.length) return null;
+        labelName = realmDisplayName(world, titles || [], p);
+      } else {
+        if (!p.domaines.length) return null;
+        for (const id of p.domaines) heldIds.add(id);
+        const members = p.domaines
+          .map((id) => world.domaines.find((d) => d.id === id) ?? world.domaines[id])
+          .filter(Boolean);
+        boundary = unitBoundary(p.boundary, members);
+        if (!boundary.length) return null;
+        labelName = p.holderName;
+      }
+
+      const score = maxPower > 0 ? Math.round(((powers.get(p.id) ?? 0) / maxPower) * 100) : 0;
+      const color = powerColor(score);
+      const u = toRender(
+        {
+          id: p.id,
+          name: `${labelName} (${score})`,
+          boundary,
+          neighbors: p.neighbors,
+        },
+        color,
+      );
+      u.selectionLevel = "possession";
+      return u;
+    })
+    .filter((u): u is RenderUnit => !!u);
+
+  const solos = world.domaines
+    .filter((d) => !heldIds.has(d.id))
+    .map((d) => {
+      const u = isSeaUnit(d) ? toRender(d, SEA_COLOR) : toRender(d, LAND_COLOR);
+      // Mer : contour = couleur de fond ⇒ invisible (pas de liseré maritime,
+      // ni entre deux cellules maritimes ni à la côte).
+      u.colorSecondary = isSeaUnit(d) ? SEA_COLOR : LAND_COLOR;
+      u.selectionLevel = "domaine";
+      return u;
+    });
+  return [...units, ...solos];
 }
 
+/** Vue Alliances — pouvoir sans lien avec le focus. */
+export const ALLIANCE_NEUTRAL_COLOR = "#8a8172";
+/** Vue Alliances — le focus (personnage cliqué / survolé, ou le joueur en partie). */
+export const ALLIANCE_SELF_COLOR = "#c4a35a";
+/** Vue Alliances — allié du focus. */
+export const ALLIANCE_ALLY_COLOR = "#3f9d52";
+/** Vue Alliances — vassal (ou sous-vassal) allié, noyé dans le royaume d’un
+ * suzerain tiers — teinte distincte d’un allié souverain à part entière :
+ * il ne peut pas rejoindre une guerre contre son propre suzerain. */
+export const ALLIANCE_VASSAL_ALLY_COLOR = "#4a9e8f";
+/** Vue Alliances — en guerre contre le focus (vue par défaut, sans sélection). */
+export const ALLIANCE_ENEMY_COLOR = "#b3392b";
+/** Vue Alliances — allié d’un ennemi du focus (vue par défaut, sans sélection). */
+export const ALLIANCE_ENEMY_ALLY_COLOR = "#c97b3d";
+
 /**
- * Vue Alliances : chaque roi/chef indépendant coloré selon son bloc
- * d’alliances (composantes connexes du graphe des alliances, y compris
- * transitives — A allié à B allié à C forment un seul bloc/couleur) — pour
- * repérer d’un coup d’œil qui est avec qui. Un pouvoir sans aucune alliance
- * reste en gris neutre.
+ * Vue Alliances : possessions colorées selon leur relation au focus
+ * (personnage cliqué / survolé, ou le joueur en partie) — le focus en doré,
+ * ses alliés directs en vert, le reste en gris neutre. Même logique que la
+ * vue Opinion, appliquée aux alliances.
+ *
+ * `enemyIds` (optionnel, vue par défaut sans sélection uniquement) met en
+ * évidence les puissances actuellement en guerre contre le focus (rouge) et
+ * leurs propres alliés (orange) — pour repérer qui risque de venir prêter
+ * main-forte à l’ennemi.
  */
 export function getAllianceUnits(
   world: WorldData,
   alliances: Alliance[] | undefined,
   playerId: number | null | undefined,
   titles?: Title[],
+  enemyIds?: number[],
 ): RenderUnit[] {
   const list = (world.possessions || []).filter(
     (p) => p.rank === "king" || p.rank === "chief",
   );
-  const idSet = new Set(list.map((p) => p.id));
 
-  const parent = new Map<number, number>();
-  function find(id: number): number {
-    let root = id;
-    while (parent.get(root) !== root) root = parent.get(root)!;
-    return root;
+  const allyIds = playerId != null ? new Set(getAllyIds(alliances, playerId)) : null;
+  const enemyIdSet = new Set(enemyIds || []);
+  const enemyAllyIds = new Set<number>();
+  for (const eid of enemyIdSet) {
+    for (const aid of getAllyIds(alliances, eid)) enemyAllyIds.add(aid);
   }
-  function union(a: number, b: number) {
-    if (!parent.has(a)) parent.set(a, a);
-    if (!parent.has(b)) parent.set(b, b);
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent.set(ra, rb);
-  }
-  for (const a of alliances || []) {
-    if (idSet.has(a.aId) && idSet.has(a.bId)) union(a.aId, a.bId);
-  }
-
-  const clusterMembers = new Map<number, number[]>();
-  for (const p of list) {
-    if (!parent.has(p.id)) continue;
-    const root = find(p.id);
-    const arr = clusterMembers.get(root) ?? [];
-    arr.push(p.id);
-    clusterMembers.set(root, arr);
-  }
-  const roots = [...clusterMembers.keys()].sort((a, b) => a - b);
-  const colorOf = new Map<number, string>();
-  roots.forEach((root, i) => colorOf.set(root, allianceClusterColor(i)));
 
   const heldIds = new Set<number>();
   const units = list
@@ -1132,10 +1232,18 @@ export function getAllianceUnits(
       }
 
       const isSelf = playerId != null && p.id === playerId;
-      const root = parent.has(p.id) ? find(p.id) : null;
-      const blocSize = root != null ? (clusterMembers.get(root)?.length ?? 0) : 0;
-      const color =
-        root != null && blocSize >= 2 ? colorOf.get(root)! : ALLIANCE_NEUTRAL_COLOR;
+      const isAlly = !isSelf && !!allyIds?.has(p.id);
+      const isEnemy = !isSelf && !isAlly && enemyIdSet.has(p.id);
+      const isEnemyAlly = !isSelf && !isAlly && !isEnemy && enemyAllyIds.has(p.id);
+      const color = isSelf
+        ? ALLIANCE_SELF_COLOR
+        : isAlly
+          ? ALLIANCE_ALLY_COLOR
+          : isEnemy
+            ? ALLIANCE_ENEMY_COLOR
+            : isEnemyAlly
+              ? ALLIANCE_ENEMY_ALLY_COLOR
+              : ALLIANCE_NEUTRAL_COLOR;
       const u = toRender(
         {
           id: p.id,
@@ -1150,15 +1258,44 @@ export function getAllianceUnits(
     })
     .filter((u): u is RenderUnit => !!u);
 
+  // Un vassal (ou sous-vassal) allié reste fondu dans le bloc royaume de son
+  // suzerain (même couleur que ce royaume — soi, allié, ennemi… selon le
+  // suzerain) — que ce royaume soit le nôtre ou celui d'un tiers. Sans ce
+  // calque, une alliance nouée avec un simple vassal (un sous-vassal peut
+  // légalement s'allier à qui il veut, seul le lien féodal direct l'interdit)
+  // resterait invisible. On redessine par-dessus ce vassal précis en vert
+  // allié, sans toucher au reste du bloc de son suzerain.
+  const vassalAllyOverlays: RenderUnit[] = [];
+  if (allyIds) {
+    for (const allyId of allyIds) {
+      const allyP = (world.possessions || []).find((x) => x.id === allyId);
+      if (!allyP || allyP.rank === "king" || allyP.rank === "chief") continue;
+      const domainIds = getRealmDomainIds(world, allyP.id);
+      const members = domainIds
+        .map((id) => world.domaines.find((d) => d.id === id) ?? world.domaines[id])
+        .filter(Boolean);
+      const boundary = unitBoundary(allyP.boundary, members);
+      if (!boundary.length) continue;
+      const u = toRender(
+        { id: allyP.id, name: allyP.holderName, boundary, neighbors: allyP.neighbors },
+        ALLIANCE_VASSAL_ALLY_COLOR,
+      );
+      u.selectionLevel = "possession";
+      vassalAllyOverlays.push(u);
+    }
+  }
+
   const solos = world.domaines
     .filter((d) => !heldIds.has(d.id))
     .map((d) => {
       const u = isSeaUnit(d) ? toRender(d, SEA_COLOR) : toRender(d, LAND_COLOR);
-      if (!isSeaUnit(d)) u.colorSecondary = LAND_COLOR;
+      // Mer : contour = couleur de fond ⇒ invisible (pas de liseré maritime,
+      // ni entre deux cellules maritimes ni à la côte).
+      u.colorSecondary = isSeaUnit(d) ? SEA_COLOR : LAND_COLOR;
       u.selectionLevel = "domaine";
       return u;
     });
-  return [...units, ...solos];
+  return [...units, ...vassalAllyOverlays, ...solos];
 }
 
 /** Vue Guerre — notre camp. */
@@ -1175,6 +1312,12 @@ export const WAR_NEUTRAL_COLOR = "#8a8172";
  * territoires restent finement contourés), coloré selon le camp qui
  * contrôle chaque domaine — notre camp en bleu, l’ennemi en rouge, un allié
  * ayant rejoint notre camp en vert, le reste du monde en neutre.
+ *
+ * L’ennemi est vérifié avant « notre camp » : dans une rébellion, le vassal
+ * qui nous déclare la guerre reste nominalement sous notre suzeraineté
+ * (`controlsDomain` suit le lien de vassalité, non rompu tant que la guerre
+ * n’est pas résolue) — sans cette priorité, ses terres ressortiraient à tort
+ * en bleu au lieu de rouge.
  */
 export function getWarUnits(
   world: WorldData,
@@ -1185,14 +1328,16 @@ export function getWarUnits(
   return world.domaines.map((d) => {
     const color = isSeaUnit(d)
       ? SEA_COLOR
-      : myId != null && controlsDomain(world, myId, d.possessionId)
-        ? WAR_SELF_COLOR
-        : enemyIds.some((eid) => controlsDomain(world, eid, d.possessionId))
-          ? WAR_ENEMY_COLOR
+      : enemyIds.some((eid) => controlsDomain(world, eid, d.possessionId))
+        ? WAR_ENEMY_COLOR
+        : myId != null && controlsDomain(world, myId, d.possessionId)
+          ? WAR_SELF_COLOR
           : allyIds.some((aid) => controlsDomain(world, aid, d.possessionId))
             ? WAR_ALLY_COLOR
             : WAR_NEUTRAL_COLOR;
     const u = toRender(d, color);
+    // Mer : contour = couleur de fond, pas un ton auto-dérivé (cf. plus haut).
+    if (isSeaUnit(d)) u.colorSecondary = SEA_COLOR;
     u.selectionLevel = "domaine";
     return u;
   });
@@ -1421,6 +1566,8 @@ export function getRenderUnits(
     opinions?: Record<string, number>;
     titles?: Title[];
     alliances?: Alliance[];
+    allianceEnemyIds?: number[];
+    armies?: Army[];
   },
 ): RenderUnit[] {
   // Domaine sélectionné hors vue Domain/Terrain/Economy → garder le maillage du parent
@@ -1432,7 +1579,10 @@ export function getRenderUnits(
       return getOpinionUnits(world, opts?.playerId, opts?.opinions, opts?.titles);
     }
     if (level === "alliance") {
-      return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles);
+      return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles, opts?.allianceEnemyIds);
+    }
+    if (level === "power") {
+      return getPowerUnits(world, opts?.opinions, opts?.armies, opts?.titles);
     }
     if (level === "domaine") return getUnits(world, "domaine");
 
@@ -1547,7 +1697,10 @@ export function getRenderUnits(
     return getOpinionUnits(world, opts?.playerId, opts?.opinions, opts?.titles);
   }
   if (level === "alliance") {
-    return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles);
+    return getAllianceUnits(world, opts?.alliances, opts?.playerId, opts?.titles, opts?.allianceEnemyIds);
+  }
+  if (level === "power") {
+    return getPowerUnits(world, opts?.opinions, opts?.armies, opts?.titles);
   }
 
   const base = getUnits(world, level, opts);

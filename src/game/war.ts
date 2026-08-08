@@ -1,6 +1,6 @@
 import type { Possession, WorldData } from "../types/world";
 import { allyTroopContribution } from "./alliance";
-import { disbandWarArmies } from "./army";
+import { disbandWarArmies, domainById } from "./army";
 import {
   addGold,
   addPrestige,
@@ -10,6 +10,7 @@ import {
   warVictoryGold,
   warVictoryPrestige,
 } from "./economy";
+import { economyFocusMultiplier, prestigeFocusMultiplier } from "./focus";
 import {
   WAR_NEIGHBOR_FEAR_MALUS,
   adjustOpinion,
@@ -116,11 +117,22 @@ export function isUnderLiege(
 }
 
 /**
+ * Traversée maritime max (en cellules de mer) pour qu'un rivage compte
+ * comme « voisin » d'un autre — une mer étroite / un détroit court (Douvres–
+ * Calais, Sicile–Tunisie, Galles–Irlande…), pas l'intégralité d'un bassin
+ * maritime interconnecté. Calibré sur `public/world.json` : Douvres–Calais
+ * ≈ 1, Galles–Irlande ≈ 2, Sicile–Tunisie ≈ 3, Douvres–Danemark ≈ 7,
+ * Angleterre–Espagne ≈ 10 (à exclure), Douvres–Italie ≈ 35.
+ */
+const MAX_SEA_HOPS = 3;
+
+/**
  * Voisins d'un domaine « traversant la mer » : ses voisins terrestres directs,
  * plus — pour tout voisin maritime — tout domaine terrestre atteignable en ne
- * traversant que des cellules de mer contiguës (une même mer navigable, quel
- * que soit le nombre de cellules à traverser). La mer elle-même n'apparaît
- * jamais dans le résultat : seuls les rivages de part et d'autre comptent.
+ * traversant que des cellules de mer contiguës, dans la limite de
+ * `MAX_SEA_HOPS` cellules (une mer étroite proche, pas l'océan tout entier).
+ * La mer elle-même n'apparaît jamais dans le résultat : seuls les rivages de
+ * part et d'autre comptent.
  * Sert uniquement à la portée diplomatique (guerre / allégeance / fabrication
  * de revendication) — le déplacement des armées reste sur le graphe brut
  * `Domaine.neighbors`, où chaque cellule de mer est une étape à part entière.
@@ -129,16 +141,26 @@ export function seaLinkedDomainNeighbors(world: WorldData, domainId: number): nu
   const start = domainById(world, domainId);
   if (!start) return [];
   const out = new Set<number>();
-  const visitedSea = new Set<number>();
+  const seaHops = new Map<number, number>();
   const queue: number[] = [...(start.neighbors || [])];
-  while (queue.length) {
-    const nid = queue.shift()!;
+  for (const nid of queue) {
+    const n = domainById(world, nid);
+    if (n?.terrainType === "sea") seaHops.set(nid, 1);
+  }
+  let qi = 0;
+  while (qi < queue.length) {
+    const nid = queue[qi++];
     const n = domainById(world, nid);
     if (!n) continue;
     if (n.terrainType === "sea") {
-      if (visitedSea.has(nid)) continue;
-      visitedSea.add(nid);
-      queue.push(...(n.neighbors || []));
+      const hops = seaHops.get(nid) ?? 1;
+      if (hops > MAX_SEA_HOPS) continue;
+      for (const nn of n.neighbors || []) {
+        if (seaHops.has(nn)) continue;
+        const nnDomain = domainById(world, nn);
+        if (nnDomain?.terrainType === "sea") seaHops.set(nn, hops + 1);
+        queue.push(nn);
+      }
     } else {
       out.add(nid);
     }
@@ -172,7 +194,7 @@ export function rebuildPossessionNeighbors(world: WorldData): void {
     if (d.possessionId == null) continue;
     const aHolders = controllers(d.possessionId);
     for (const nid of seaLinkedDomainNeighbors(world, d.id)) {
-      const o = world.domaines.find((x) => x.id === nid) ?? world.domaines[nid];
+      const o = domainById(world, nid);
       if (!o || o.possessionId == null || o.possessionId === d.possessionId) continue;
       const bHolders = controllers(o.possessionId);
       for (const a of aHolders) {
@@ -191,9 +213,7 @@ export function rebuildPossessionNeighbors(world: WorldData): void {
 }
 
 function recomputeCentroid(world: WorldData, p: Possession): void {
-  const members = p.domaines
-    .map((id) => world.domaines.find((d) => d.id === id) ?? world.domaines[id])
-    .filter(Boolean);
+  const members = p.domaines.map((id) => domainById(world, id)).filter(Boolean);
   if (!members.length) return;
   let sx = 0,
     sy = 0;
@@ -355,7 +375,7 @@ export function removePossession(world: WorldData, id: number): void {
   }
   // Domaines orphelins → fond de carte évité : détacher la référence
   for (const did of p.domaines) {
-    const d = world.domaines.find((x) => x.id === did) ?? world.domaines[did];
+    const d = domainById(world, did);
     if (d && d.possessionId === id) d.possessionId = undefined;
   }
   for (const d of world.domaines) {
@@ -388,7 +408,7 @@ export function transferDomains(
   const take = new Set(domainIds);
   from.domaines = from.domaines.filter((id) => !take.has(id));
   for (const id of take) {
-    const d = world.domaines.find((x) => x.id === id) ?? world.domaines[id];
+    const d = domainById(world, id);
     if (d) d.possessionId = to.id;
     if (!to.domaines.includes(id)) to.domaines.push(id);
   }
@@ -434,10 +454,6 @@ function scheduleProvinceDrift(game: GameState, winner: Possession, domainId: nu
     dueDay: game.day,
     actorId: winner.id,
   });
-}
-
-function domainById(world: WorldData, id: number) {
-  return world.domaines.find((x) => x.id === id) ?? world.domaines[id];
 }
 
 /** Domaines du demesne + vassaux récursifs (base amie pour démarrer le BFS). */
@@ -643,10 +659,32 @@ function resolveDeposeVictory(
   rebuildPossessionNeighbors(game.world);
 }
 
-/** Dissout les armées de la guerre et la retire de la liste des guerres actives. */
+/** Durée d’une trêve après la conclusion d’une guerre (années). */
+export const WAR_TRUCE_YEARS = 1;
+
+function truceKey(aId: number, bId: number): string {
+  return aId < bId ? `${aId}:${bId}` : `${bId}:${aId}`;
+}
+
+/** Année jusqu’à laquelle une trêve entre ces deux-là est en vigueur (undefined si aucune). */
+export function truceUntilYear(game: GameState, aId: number, bId: number): number | undefined {
+  return (game.warTruces || {})[truceKey(aId, bId)];
+}
+
+/** Trêve en cours entre les deux belligérants principaux d’une guerre conclue. */
+export function isTruceActive(game: GameState, aId: number, bId: number): boolean {
+  const until = truceUntilYear(game, aId, bId);
+  return until != null && game.year < until;
+}
+
+/** Dissout les armées de la guerre, la retire des guerres actives, et impose une trêve entre les deux belligérants principaux. */
 export function concludeWar(game: GameState, war: WarState): void {
   disbandWarArmies(game, war);
   game.wars = game.wars.filter((w) => w.id !== war.id);
+  game.warTruces = {
+    ...(game.warTruces || {}),
+    [truceKey(war.attackerId, war.defenderId)]: game.year + WAR_TRUCE_YEARS,
+  };
 }
 
 /**
@@ -668,14 +706,19 @@ export function resolveWarVictory(
 
   if (war) concludeWar(game, war);
 
-  const prestigeGain = warVictoryPrestige(loser.rank);
+  const prestigeGain = Math.round(
+    warVictoryPrestige(loser.rank) * prestigeFocusMultiplier(winner) * 10,
+  ) / 10;
   addPrestige(winner, prestigeGain);
   // Domaines effectivement récupérés : le war goal si claim war, sinon l'ampleur du territoire capturé par siège.
   const wonDomainCount =
     war?.warGoalDomainIds?.length ??
     ((war?.capturedByAttacker?.length ?? 0) + (war?.capturedByDefender?.length ?? 0));
-  const goldGain =
-    warVictoryGold(game.world, loser) + warVictoryDomainGold(wonDomainCount);
+  const goldGain = Math.round(
+    (warVictoryGold(game.world, loser) + warVictoryDomainGold(wonDomainCount)) *
+      economyFocusMultiplier(winner) *
+      10,
+  ) / 10;
   addGold(winner, goldGain);
   const parties = [winnerId, loserId];
   const logWar = (text: string) => pushLog(game, text, parties);
@@ -785,6 +828,32 @@ export function resolveWarVictory(
       );
     }
     rebuildPossessionNeighbors(game.world);
+    finishPlayerDefeat();
+    return;
+  }
+
+  if (casusBelli === "vassalize") {
+    // Seul l'agresseur (attaquant) gagne le droit de vassaliser en cas de victoire.
+    if (war && winnerId === war.attackerId) {
+      logWar(
+        `${loser.holderName} submits to ${winner.holderName} after a failed defense.`,
+      );
+      applyFear(conqueredDomains());
+      attachAsVassal(game.world, loser, winner);
+      adjustOpinion(game.opinions, loser.id, winner.id, -40);
+      if (game.playerId === loser.id) {
+        pushLog(game, `You are forced to submit to ${winner.holderName} as their vassal.`);
+      }
+      rebuildPossessionNeighbors(game.world);
+      finishPlayerDefeat();
+      return;
+    }
+    // Le défenseur repousse la tentative de vassalisation — reste indépendant.
+    logWar(
+      `${winner.holderName} repels ${loser.holderName}'s bid to force their submission.`,
+    );
+    adjustOpinion(game.opinions, winnerId, loserId, -30);
+    applyFear(conqueredDomains());
     finishPlayerDefeat();
     return;
   }

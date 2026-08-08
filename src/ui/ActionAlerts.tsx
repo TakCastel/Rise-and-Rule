@@ -16,6 +16,7 @@ import {
   listAvailableActions,
   type AvailableActionTarget,
   type AvailableDomainGrant,
+  type AvailableProvinceTitleCession,
 } from "../game/actions";
 import { listCallableAllies, listIncomingAllyCalls } from "../game/ally-war";
 import { formatGold, formatPrestige } from "../game/economy";
@@ -42,6 +43,7 @@ interface ActionAlertsProps {
   onAllegiance: (id: number) => void;
   onAlliance?: (id: number) => void;
   onGrantDomain: (domainId: number) => void;
+  onCedeProvinceTitle?: (provinceId: number, vassalId: number) => void;
   onClaimProvince?: (provinceId: number) => void;
   onClaimKingdom?: (royaumeId: number) => void;
   onFoundKingdom?: (provinceId: number) => void;
@@ -73,6 +75,7 @@ export function ActionAlerts({
   onAllegiance,
   onAlliance,
   onGrantDomain,
+  onCedeProvinceTitle,
   onClaimProvince,
   onClaimKingdom,
   onFoundKingdom,
@@ -286,22 +289,26 @@ export function ActionAlerts({
   }, [section, onHover]);
 
   function pickSection(next: AlertSection) {
-    setSection((cur) => {
-      const opening = cur !== next ? next : null;
-      if (opening === "claim" && available.provinceClaims[0]) {
-        onSelectProvince?.(available.provinceClaims[0].provinceId);
-      } else if (opening === "claim" && available.kingdomClaims[0]) {
-        onSelectKingdom?.(available.kingdomClaims[0].royaumeId);
-      } else if (opening === "found" && available.kingdomFoundations[0]) {
-        onSelectProvince?.(available.kingdomFoundations[0].seedProvinceId);
-      } else if (opening === "fabricate") {
-        const first =
-          available.fabricationProgress[0]?.domainId ??
-          available.domainFabrications[0]?.domainId;
-        if (first != null) onSelectDomain?.(first);
-      }
-      return opening;
-    });
+    // Ces appels (onSelect*) mettent à jour l'état d'un composant parent
+    // (App) — ne jamais les faire depuis le callback de `setSection`
+    // ci-dessous : un updater de state doit rester pur, React le rejoue
+    // (StrictMode, etc.) et se plaint alors de « setState pendant le rendu
+    // d'un autre composant ». `section` est déjà à jour ici (on est dans un
+    // handler de clic, pas un rendu), donc pas besoin de la forme fonctionnelle.
+    const opening = section !== next ? next : null;
+    if (opening === "claim" && available.provinceClaims[0]) {
+      onSelectProvince?.(available.provinceClaims[0].provinceId);
+    } else if (opening === "claim" && available.kingdomClaims[0]) {
+      onSelectKingdom?.(available.kingdomClaims[0].royaumeId);
+    } else if (opening === "found" && available.kingdomFoundations[0]) {
+      onSelectProvince?.(available.kingdomFoundations[0].seedProvinceId);
+    } else if (opening === "fabricate") {
+      const first =
+        available.fabricationProgress[0]?.domainId ??
+        available.domainFabrications[0]?.domainId;
+      if (first != null) onSelectDomain?.(first);
+    }
+    setSection(opening);
     onHover?.(null);
   }
 
@@ -323,6 +330,11 @@ export function ActionAlerts({
 
   function grant(domain: AvailableDomainGrant) {
     onGrantDomain(domain.id);
+    onHover?.(null);
+  }
+
+  function cedeTitle(cession: AvailableProvinceTitleCession) {
+    onCedeProvinceTitle?.(cession.id, cession.vassalId);
     onHover?.(null);
   }
 
@@ -798,23 +810,23 @@ export function ActionAlerts({
 
           {section === "provinces" && (
             <ul className="action-alerts-list">
-              {available.excessProvinceDomains.map((d) => (
-                <li key={d.id}>
+              {available.excessProvinceTitles.map((c) => (
+                <li key={c.id}>
                   <button
                     type="button"
                     className="action-alerts-item"
-                    onClick={() => grant(d)}
-                    onMouseEnter={() => onSelectDomain?.(d.id)}
-                    onFocus={() => onSelectDomain?.(d.id)}
+                    onClick={() => cedeTitle(c)}
+                    onMouseEnter={() => onSelectProvince?.(c.id)}
+                    onFocus={() => onSelectProvince?.(c.id)}
                   >
                     <span className="action-alerts-item-name">
-                      {d.name}
+                      {c.name}
                       <span className="action-alerts-item-title">
                         {" "}
-                        · +{formatGold(d.income)}/mo
+                        · {c.domainsHeld} domain{c.domainsHeld === 1 ? "" : "s"} held
                       </span>
                     </span>
-                    <span className="action-alerts-item-meta">grant vassal</span>
+                    <span className="action-alerts-item-meta">cede title to {c.vassalName}</span>
                   </button>
                 </li>
               ))}

@@ -3022,10 +3022,15 @@ try {
   console.warn("  sea buffer failed, falling back to full water mask:", e.message);
 }
 
-/** Graines maritimes : grille ~110 km, propriétés minimales attendues par partitionDomainsFromCities. */
+/**
+ * Graines maritimes : grille large (~380 km, contre ~110 km à l'origine) —
+ * la mer doit lire comme de grandes étendues navigables, pas comme un
+ * pavage fin façon domaines terrestres. Beaucoup moins de graines ⇒
+ * beaucoup moins de cellules par mer nommée, chacune bien plus grande.
+ */
 const seaSeedGrid = turf.pointGrid(
   [BBOX.lonMin, BBOX.latMin, BBOX.lonMax, BBOX.latMax],
-  110,
+  380,
   { mask: coastalWaterMask, units: "kilometers" },
 );
 const seaSeeds = seaSeedGrid.features.map((f, i) => {
@@ -3034,22 +3039,125 @@ const seaSeeds = seaSeedGrid.features.map((f, i) => {
 });
 console.log(`  ${seaSeeds.length} graines maritimes`);
 
-// Cellules brutes (raster, angles droits) — JAMAIS lissées individuellement :
-// lisser chaque cellule séparément (chaïkin) fait diverger deux voisines le
-// long de leur bord commun (l'arrondi dépend de l'ordre des sommets propre
-// à chaque anneau), ce qui recrée un liseré en dents de scie à l'échelle de
-// la côte entière — pire que sans lissage. On les garde brutes, exactement
-// comme les domaines terrestres (`d.rings` directement, jamais post-traités
-// non plus) — au même pas que la terre (0.034°), le cran d'escalier de la
-// mer reste du même ordre que celui, déjà accepté, des domaines terrestres.
+// Cellules brutes (raster, angles droits) — JAMAIS arrondies individuellement
+// (chaïkin) : arrondir chaque cellule séparément fait diverger deux voisines
+// le long de leur bord commun (l'arrondi dépend de l'ordre des sommets
+// propre à chaque anneau), ce qui recrée un liseré en dents de scie à
+// l'échelle de la côte entière — pire que sans lissage. `stepDeg` nettement
+// plus grossier que la terre (~18 km contre ~3,7 km) : des bords de cellule
+// intrinsèquement plus « en blocs », moins organiques.
 const { domains: rawSeaCells } = partitionDomainsFromCities({
   bbox: BBOX,
   cities: seaSeeds,
   landMask: coastalWaterMask,
   impassableRings: [],
-  stepDeg: 0.034,
+  stepDeg: 0.16,
 });
-const rawSeaWithZone = rawSeaCells.map((d) => ({ ...d, zoneName: labelSea(d.centroid[0], d.centroid[1]).name }));
+
+/**
+ * Redresse le zigzag résiduel du raster (segments quasi colinéaires
+ * fusionnés) — simplification pure, PAS de chaïkin ici : on veut des bords
+ * plus droits, pas plus arrondis. Appliquée à chaque cellule individuelle
+ * (contrairement à `smoothRings` plus bas, qui lisse la référence côtière
+ * externe unique) : les arêtes internes cellule-à-cellule restent donc
+ * cohérentes entre voisines (même raster source), juste plus rectilignes.
+ */
+function straightenRings(rings) {
+  return (rings || []).map((r) => {
+    if (r.length < 4) return r;
+    try {
+      const simplified = turf.simplify(turf.polygon([closeRing(r)]), {
+        tolerance: 0.04,
+        highQuality: false,
+      });
+      const coords = simplified.geometry.coordinates[0];
+      return coords.length >= 4 ? coords : r;
+    } catch {
+      return r;
+    }
+  });
+}
+
+const rawSeaWithZone = rawSeaCells.map((d) => ({
+  ...d,
+  rings: straightenRings(d.rings),
+  zoneName: labelSea(d.centroid[0], d.centroid[1]).name,
+}));
+
+/** Simplifie (purge les points colinéaires) puis arrondit au chaïkin. */
+function smoothRings(rings) {
+  return (rings || []).map((r) => {
+    if (r.length < 4) return r;
+    let ring = r;
+    try {
+      const simplified = turf.simplify(turf.polygon([closeRing(ring)]), {
+        tolerance: 0.012,
+        highQuality: false,
+      });
+      const coords = simplified.geometry.coordinates[0];
+      if (coords.length >= 4) ring = coords;
+    } catch {
+      /* garde le contour brut */
+    }
+    return ring.length >= 4 ? chaikinRing(ring, 2) : ring;
+  });
+}
+
+/**
+ * Référence lissée UNIQUE de tout le maillage maritime (toutes cellules
+ * fusionnées, arêtes internes annulées par `turf.union`, PUIS lissée une
+ * seule fois) — chaque cellule brute est ensuite découpée contre cette même
+ * référence : deux cellules voisines qui touchent le bord extérieur se
+ * calent donc exactement sur la même courbe plutôt que de diverger chacune
+ * de leur côté. Les arêtes internes (cellule à cellule) restent brutes,
+ * cohérentes avec le style anguleux déjà utilisé pour les domaines terrestres.
+ */
+console.log("  lissage de la référence côtière maritime…");
+const seaMaskRaw = dissolveDomainBoundaries(rawSeaWithZone.map((d) => ({ boundary: d.rings })));
+const seaMaskFeature = domainRingsToFeature(smoothRings(seaMaskRaw));
+
+/**
+ * `turf.intersect`/`turf.simplify` peuvent laisser un minuscule fragment
+ * détaché (triangle/quad) en plus de la forme principale — surtout depuis
+ * que les cellules maritimes sont bien plus grandes (grille à 380 km) et
+ * plus redressées (`straightenRings`) qu'avant, ce qui rend l'intersection
+ * avec le masque côtier plus sujette à ces débris. On ne garde que les
+ * anneaux dont l'aire dépasse un seuil minuscule (bien en dessous de la
+ * plus petite cellule maritime légitime) — élimine les débris flottants
+ * sans jamais pouvoir couper un vrai morceau de mer.
+ */
+const MIN_RING_AREA_KM2 = 80;
+/** Un débris peut largement dépasser ce plancher absolu tout en restant
+ * dérisoire *relativement* à la cellule principale (quelques dixièmes de
+ * pourcent) — un seuil purement relatif à la plus grande aire du domaine
+ * s'auto-calibre, contrairement à un seuil fixe. */
+const MIN_RING_AREA_FRACTION = 0.05;
+function dropSliverRings(rings) {
+  if (!rings || rings.length <= 1) return rings;
+  const areas = rings.map((r) => {
+    try {
+      return turf.area(turf.polygon([closeRing(r)])) / 1e6;
+    } catch {
+      return 0;
+    }
+  });
+  const maxArea = Math.max(...areas);
+  const kept = rings.filter((r, i) => areas[i] >= MIN_RING_AREA_KM2 && areas[i] >= maxArea * MIN_RING_AREA_FRACTION);
+  return kept.length ? kept : rings;
+}
+
+function clipToSeaMask(rings) {
+  if (!seaMaskFeature) return dropSliverRings(rings);
+  const rawFeature = domainRingsToFeature(rings);
+  if (!rawFeature) return dropSliverRings(rings);
+  try {
+    const clipped = turf.intersect(turf.featureCollection([rawFeature, seaMaskFeature]));
+    const out = featureToExteriorRings(clipped);
+    return dropSliverRings(out.length ? out : rings);
+  } catch {
+    return dropSliverRings(rings);
+  }
+}
 
 // Une mer nommée regroupe plusieurs cellules distinctes — chacune reste un
 // domaine à part entière (« un peu plus grand qu'un domaine terrestre »,
@@ -3069,10 +3177,62 @@ const seaDomaines = rawSeaWithZone.map((d, i) => ({
   income: 0,
   areaKm2: Math.round((domainAreaKm2({ boundary: d.rings }) || 0) * 10) / 10,
   terrainType: "sea",
-  boundary: d.rings,
+  boundary: clipToSeaMask(d.rings),
   neighbors: (d.neighbors || []).map((n) => seaIdOffset + n),
 }));
 console.log(`  ${seaDomaines.length} domaines maritimes`);
+
+/**
+ * Une cellule peut ressortir du découpage/intersection avec une aire
+ * dérisoire face à ses voisines (bord de grille, pincement du masque
+ * côtier) — visible sur la carte comme un éclat difforme flottant en pleine
+ * mer. Au lieu de la garder comme domaine à part entière (ou de la
+ * supprimer sèchement, ce qui casserait les références de voisinage), on la
+ * fusionne dans sa plus grande voisine directe : ses propres voisins
+ * deviennent voisins de la survivante, et son id disparaît de partout.
+ */
+const MIN_SEA_DOMAIN_AREA_KM2 = 8000;
+{
+  const byId = new Map(seaDomaines.map((d) => [d.id, d]));
+  let mergedCount = 0;
+  for (const d of [...seaDomaines]) {
+    if ((d.areaKm2 || 0) >= MIN_SEA_DOMAIN_AREA_KM2) continue;
+    if (!byId.has(d.id)) continue; // déjà absorbée par une fusion précédente
+    const candidates = (d.neighbors || []).map((nid) => byId.get(nid)).filter((n) => n && n !== d);
+    if (!candidates.length) continue; // aucune voisine vivante — on la laisse telle quelle
+    candidates.sort((a, b) => (b.areaKm2 || 0) - (a.areaKm2 || 0));
+    const target = candidates[0];
+    try {
+      const merged = turf.union(
+        turf.featureCollection([domainRingsToFeature(d.boundary), domainRingsToFeature(target.boundary)]),
+      );
+      const rings = featureToExteriorRings(merged);
+      if (rings.length) target.boundary = rings;
+    } catch {
+      /* garde le contour de la survivante tel quel si l'union échoue */
+    }
+    target.areaKm2 = Math.round(((target.areaKm2 || 0) + (d.areaKm2 || 0)) * 10) / 10;
+    for (const nid of d.neighbors || []) {
+      if (nid === target.id) continue;
+      const nb = byId.get(nid);
+      if (!nb) continue;
+      nb.neighbors = [...new Set((nb.neighbors || []).map((x) => (x === d.id ? target.id : x)))].filter(
+        (x) => x !== nb.id,
+      );
+      if (!target.neighbors.includes(nid)) target.neighbors.push(nid);
+    }
+    target.neighbors = [...new Set(target.neighbors)].filter((x) => x !== d.id && x !== target.id);
+    byId.delete(d.id);
+    mergedCount++;
+  }
+  if (mergedCount) {
+    const kept = new Set(byId.keys());
+    for (let i = seaDomaines.length - 1; i >= 0; i--) {
+      if (!kept.has(seaDomaines[i].id)) seaDomaines.splice(i, 1);
+    }
+    console.log(`  ${mergedCount} cellule(s) maritime(s) dérisoire(s) fusionnée(s) dans leur voisine`);
+  }
+}
 
 // Rattache chaque côte à la/les mer(s) nommée(s) qu'elle touche (test
 // géométrique — deux maillages indépendants, pas de correspondance directe

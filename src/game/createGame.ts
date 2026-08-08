@@ -52,9 +52,12 @@ export function createGame(template: WorldData): GameState {
     nextFabricationId: 1,
     opinions,
     giftsSent: {},
+    warTruces: {},
     alliances: [],
     allyCallRequests: [],
     nextAllyCallRequestId: 1,
+    allegianceDemands: [],
+    nextAllegianceDemandId: 1,
     notices: [],
     nextNoticeId: 1,
     log: [

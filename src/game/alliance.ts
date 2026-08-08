@@ -1,4 +1,5 @@
 import type { Possession, WorldData } from "../types/world";
+import type { Army } from "./army";
 import { possessionPower } from "./power";
 import type { Alliance, GameState } from "./types";
 import { pushLog } from "./types";
@@ -106,6 +107,7 @@ export function allyTroopContribution(
   p: Possession,
   opinions: Record<string, number> | undefined,
   alliances: Alliance[] | undefined,
+  armies?: Army[],
 ): number {
   let total = 0;
   const vassalSet = new Set(p.vassalIds || []);
@@ -114,7 +116,7 @@ export function allyTroopContribution(
     if (allyId === p.liegeId) continue;
     const ally = findPossession(world, allyId);
     if (!ally) continue;
-    total += possessionPower(world, ally, opinions);
+    total += possessionPower(world, ally, opinions, armies);
   }
   return total;
 }
@@ -260,7 +262,7 @@ export function listAlliedBlocThreats(
         }
         const v = findPossession(game.world, vid);
         if (!v) continue;
-        const pw = possessionPower(game.world, v, game.opinions);
+        const pw = possessionPower(game.world, v, game.opinions, game.armies);
         blocPower += pw;
         if (pw > leaderPower) {
           leaderPower = pw;
@@ -269,7 +271,7 @@ export function listAlliedBlocThreats(
       }
       if (busy) continue;
 
-      const liegePower = possessionPower(game.world, liege, game.opinions);
+      const liegePower = possessionPower(game.world, liege, game.opinions, game.armies);
       if (blocPower < liegePower * ALLIED_BLOC_POWER_RATIO) continue;
 
       const leader = findPossession(game.world, leaderId);

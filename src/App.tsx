@@ -5,7 +5,18 @@ import { formatDate } from "./game/tick";
 import { findKingdomTitle, realmDisplayName } from "./game/titles";
 import type { GameSpeed } from "./game/types";
 import { MapView } from "./map/MapView";
-import { TERRAIN_PALETTE, developmentColor, opinionColor } from "./map/levels";
+import {
+  ALLIANCE_ALLY_COLOR,
+  ALLIANCE_ENEMY_ALLY_COLOR,
+  ALLIANCE_ENEMY_COLOR,
+  ALLIANCE_NEUTRAL_COLOR,
+  ALLIANCE_SELF_COLOR,
+  ALLIANCE_VASSAL_ALLY_COLOR,
+  TERRAIN_PALETTE,
+  developmentColor,
+  opinionColor,
+  powerColor,
+} from "./map/levels";
 import type { LevelName, Selection, TerrainType, WorldData } from "./types/world";
 import { GameMenu } from "./ui/GameMenu";
 import { ActionAlerts } from "./ui/ActionAlerts";
@@ -17,6 +28,8 @@ import { SelectionCard } from "./ui/SelectionCard";
 import { WarIcon } from "./ui/WarIcon";
 import { WarPanel } from "./ui/WarPanel";
 import { NoticeModal } from "./ui/NoticeModal";
+import { AllegianceDemandModal } from "./ui/AllegianceDemandModal";
+import { NoticeToastStack } from "./ui/NoticeToastStack";
 import { cn } from "@/lib/utils";
 import "./App.css";
 
@@ -77,10 +90,12 @@ function App() {
     doAlliance,
     doGift,
     doGrant,
+    doCedeProvinceTitle,
     doRebel,
     doClaimProvince,
     doClaimKingdom,
     doRenameKingdom,
+    doSetFocus,
     doFoundKingdom,
     doFabricateClaim,
     doCancelFabricateClaim,
@@ -93,6 +108,7 @@ function App() {
     doPressDemands,
     doCallAlly,
     doRespondAllyCall,
+    doRespondAllegianceDemand,
     doDismissNotice,
   } = useGame(template);
 
@@ -117,23 +133,45 @@ function App() {
     if (game?.phase !== "play") setRenamingRealm(false);
   }, [game?.phase]);
 
+  // Guerre focalisée conclue → on lâche le focus, et si la vue Guerre n'a
+  // plus rien à montrer (focus perdu sans guerre en cours), on repasse en
+  // vue normale plutôt que de rester bloqué sur un filtre vide.
   useEffect(() => {
-    if (focusWarId == null || game?.phase !== "play" || game.playerId == null) return;
-    const stillAtWar = game.wars.some(
-      (w) => w.attackerId === game.playerId || w.defenderId === game.playerId,
-    );
-    if (!stillAtWar) setFocusWarId(null);
-  }, [focusWarId, game?.phase, game?.playerId, game?.wars]);
+    if (game?.phase !== "play" || game.playerId == null) return;
+    if (focusWarId != null) {
+      if (!game.wars.some((w) => w.id === focusWarId)) {
+        setFocusWarId(null);
+        if (level === "war") setLevel("possession");
+      }
+      return;
+    }
+    if (level === "war") {
+      const stillAtWar = game.wars.some(
+        (w) => w.attackerId === game.playerId || w.defenderId === game.playerId,
+      );
+      if (!stillAtWar) setLevel("possession");
+    }
+  }, [focusWarId, game?.phase, game?.playerId, game?.wars, level]);
 
   useEffect(() => {
     if (game?.phase !== "play") return;
     function onKeyDown(e: KeyboardEvent) {
-      if (e.code !== "Space") return;
       const target = e.target as HTMLElement | null;
       if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
       if (target?.isContentEditable) return;
-      e.preventDefault();
-      setPlaying(!game!.playing);
+      if (e.code === "Space") {
+        e.preventDefault();
+        setPlaying(!game!.playing);
+        return;
+      }
+      if (e.code === "Escape") {
+        e.preventDefault();
+        // Même reset que cliquer l'onglet "Possession" du sélecteur de niveau.
+        setLevel("possession");
+        setSelection((sel) =>
+          sel && (sel.level === "possession" || sel.level === "domaine") ? sel : null,
+        );
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -227,6 +265,53 @@ function App() {
           label: b.label,
           color: opinionColor(b.score),
         }))
+      : [];
+
+  const powerLegend =
+    showLegend && level === "power"
+      ? ECONOMY_BANDS.map((b) => ({
+          label: b.label,
+          color: powerColor(b.score),
+        }))
+      : [];
+
+  // Le bandeau BattleOverlay (déjà rendu plus bas, indépendamment de la vue)
+  // ne prend la place du volet Guerre que si on a précisément sélectionné une
+  // des troupes engagées dans ce combat — sinon le volet Guerre (progression
+  // globale de la guerre) reste visible, même si une bataille est en cours.
+  const warPanelBattling =
+    inPlay && game && level === "war" && focusWarId != null && selectedArmyId != null
+      ? game.armies.some(
+          (a) =>
+            a.warId === focusWarId &&
+            a.stance === "battling" &&
+            a.id === selectedArmyId,
+        )
+      : false;
+
+  const allianceLegendTitle = opinionFocusName
+    ? `Alliances of ${opinionFocusName}`
+    : "Alliances of you";
+  const allianceAtWar =
+    !selection &&
+    game?.playerId != null &&
+    (game.wars || []).some(
+      (w) => w.attackerId === game.playerId || w.defenderId === game.playerId,
+    );
+  const allianceLegend =
+    showLegend && level === "alliance"
+      ? [
+          { label: opinionFocusName ?? "You", color: ALLIANCE_SELF_COLOR },
+          { label: "Ally", color: ALLIANCE_ALLY_COLOR },
+          { label: "Allied vassal", color: ALLIANCE_VASSAL_ALLY_COLOR },
+          ...(allianceAtWar
+            ? [
+                { label: "At war with you", color: ALLIANCE_ENEMY_COLOR },
+                { label: "Enemy's ally", color: ALLIANCE_ENEMY_ALLY_COLOR },
+              ]
+            : []),
+          { label: "Other", color: ALLIANCE_NEUTRAL_COLOR },
+        ]
       : [];
 
   return (
@@ -382,6 +467,9 @@ function App() {
                 onGrantDomain={(domainId) => {
                   doGrant(domainId, null);
                 }}
+                onCedeProvinceTitle={(provinceId, vassalId) => {
+                  doCedeProvinceTitle(provinceId, vassalId);
+                }}
                 onClaimProvince={(provinceId) => {
                   doClaimProvince(provinceId);
                 }}
@@ -424,12 +512,15 @@ function App() {
               />
             </div>
           )}
-          {inPlay && game && level === "war" && focusWarId != null && (
+          {inPlay && game && level === "war" && focusWarId != null && !warPanelBattling && (
             <div id="war-panel-overlay">
               <WarPanel
                 game={game}
                 focusWarId={focusWarId}
-                onClose={() => setFocusWarId(null)}
+                onClose={() => {
+                  setFocusWarId(null);
+                  setLevel("possession");
+                }}
                 onRaiseLevies={doRaiseLevies}
                 onSurrender={doSurrenderWar}
                 onWhitePeace={doWhitePeace}
@@ -475,6 +566,28 @@ function App() {
             <div id="terrain-legend-overlay">
               <div className="legend-title">{opinionLegendTitle}</div>
               {opinionLegend.map((row) => (
+                <div key={row.label} className="legend-row">
+                  <span className="swatch" style={{ background: row.color }} />
+                  <span>{row.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {allianceLegend.length > 0 && (
+            <div id="terrain-legend-overlay">
+              <div className="legend-title">{allianceLegendTitle}</div>
+              {allianceLegend.map((row) => (
+                <div key={row.label} className="legend-row">
+                  <span className="swatch" style={{ background: row.color }} />
+                  <span>{row.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {powerLegend.length > 0 && (
+            <div id="terrain-legend-overlay">
+              <div className="legend-title">Power</div>
+              {powerLegend.map((row) => (
                 <div key={row.label} className="legend-row">
                   <span className="swatch" style={{ background: row.color }} />
                   <span>{row.label}</span>
@@ -636,6 +749,12 @@ function App() {
               )}
             </div>
           )}
+          {game && (
+            <NoticeToastStack
+              notices={game.notices.filter((n) => n.blocking === false)}
+              onDismiss={doDismissNotice}
+            />
+          )}
         </div>
         <aside id="side-panel">
           <GameMenu
@@ -665,15 +784,24 @@ function App() {
             onMainMenu={returnToMenu}
             onPlayAnyoneChange={setPlayAnyone}
             onHover={setHoverId}
+            onSetFocus={doSetFocus}
           />
         </aside>
       </main>
       {game && (
         <NoticeModal
-          notice={game.notices[0]}
+          notice={game.notices.find((n) => n.blocking !== false)}
           onDismiss={(noticeId) => doDismissNotice(noticeId)}
         />
       )}
+      {game &&
+        !game.notices.some((n) => n.blocking !== false) &&
+        (game.allegianceDemands || []).length > 0 && (
+          <AllegianceDemandModal
+            game={game}
+            onRespond={(requestId, accept) => doRespondAllegianceDemand(requestId, accept)}
+          />
+        )}
     </div>
   );
 }

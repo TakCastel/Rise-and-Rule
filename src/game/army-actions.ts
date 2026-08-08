@@ -1,6 +1,6 @@
-import type { Possession, WorldData } from "../types/world";
 import {
   ARMY_MIN_TROOPS,
+  capitalDomainId,
   chargeNavalEmbarkation,
   domainById,
   findMarchPath,
@@ -28,19 +28,6 @@ function otherSideId(war: WarState, actorId: number): number | null {
   return null;
 }
 
-/** Domaine « capitale » d’une possession : le plus développé de son demesne. */
-function homeDomainId(world: WorldData, actor: Possession): number | undefined {
-  if (!actor.domaines?.length) return undefined;
-  let best: { id: number; score: number } | undefined;
-  for (const id of actor.domaines) {
-    const d = domainById(world, id);
-    if (!d) continue;
-    const score = d.development ?? 0;
-    if (!best || score > best.score) best = { id, score };
-  }
-  return best?.id ?? actor.domaines[0];
-}
-
 /** Lève une armée (une des levées disponibles) pour l’un des deux camps d’une guerre en cours. */
 export function raiseLevies(
   game: GameState,
@@ -65,7 +52,7 @@ export function raiseLevies(
     }
     return false;
   }
-  const home = homeDomainId(game.world, actor);
+  const home = capitalDomainId(game.world, actor);
   if (home == null) return false;
 
   if (!game.armies) game.armies = [];
@@ -155,20 +142,39 @@ export function orderMarch(
   destinationDomainId: number,
   actorId: number = game.playerId ?? -1,
 ): boolean {
+  const isPlayer = actorId === game.playerId;
   const army = game.armies.find((a) => a.id === armyId);
   if (!army || army.ownerId !== actorId) return false;
-  if (army.stance !== "idle" && army.stance !== "moving") return false;
+  if (army.stance !== "idle" && army.stance !== "moving") {
+    if (isPlayer) {
+      pushLog(
+        game,
+        army.stance === "routing"
+          ? `That army is routed and fleeing — it cannot be ordered to march until it regroups.`
+          : `That army is engaged and cannot be ordered to march.`,
+      );
+    }
+    return false;
+  }
 
   if (army.stance === "moving" && army.path?.length) {
     const committedNextId = army.path[0];
+    if (committedNextId === destinationDomainId) return true;
     const rest = findMarchPath(game.world, committedNextId, destinationDomainId);
-    if (!rest) return false;
+    if (!rest) {
+      if (isPlayer) pushLog(game, `No route to that destination.`);
+      return false;
+    }
     army.path = [committedNextId, ...rest];
     return true;
   }
 
+  if (army.domainId === destinationDomainId) return true;
   const path = findMarchPath(game.world, army.domainId, destinationDomainId);
-  if (!path || !path.length) return false;
+  if (!path || !path.length) {
+    if (isPlayer) pushLog(game, `No route to that destination.`);
+    return false;
+  }
 
   chargeNavalEmbarkation(game, army, army.domainId, path[0]);
   army.path = path;
@@ -183,32 +189,6 @@ export interface PressDemandsCheck {
   reason?: string;
 }
 
-/** Éligibilité à « appuyer nos exigences » — équivalent du 100 % de l’ancien front, piloté par les captures réelles. */
-export function canPressDemands(war: WarState, actorId: number): PressDemandsCheck {
-  const isAttacker = actorId === war.attackerId;
-  if (!isAttacker && actorId !== war.defenderId) return { ok: false, reason: "Not a party to this war" };
-
-  const cb = war.casusBelli ?? "claim_province";
-  if ((cb === "claim_province" || cb === "conquest") && isAttacker) {
-    const goalIds = war.warGoalDomainIds?.length ? war.warGoalDomainIds : war.conquestOrder;
-    if (!goalIds?.length) return { ok: false, reason: "No war goal" };
-    // Occupé militairement (siège terminé), pas forcément déjà transféré —
-    // le transfert réel n’a lieu qu’à la résolution de la guerre.
-    const captured = new Set(war.capturedByAttacker || []);
-    const secured = goalIds.every((id) => captured.has(id));
-    return secured ? { ok: true } : { ok: false, reason: "War goal not yet secured" };
-  }
-
-  if (isAttacker) {
-    const total = war.conquestOrder?.length ?? 0;
-    if (total > 0 && (war.capturedByAttacker?.length ?? 0) >= total) return { ok: true };
-    return { ok: false, reason: "The enemy realm is not yet fully conquered" };
-  }
-  const total = war.attackerFrontOrder?.length ?? 0;
-  if (total > 0 && (war.capturedByDefender?.length ?? 0) >= total) return { ok: true };
-  return { ok: false, reason: "You have not overrun enough of their homeland" };
-}
-
 /** Poids du score de guerre : territoire pris sur l'ensemble du royaume adverse (le gros du score, proportionnel à sa taille). */
 const WAR_SCORE_TERRITORY_WEIGHT = 65;
 /** Bonus pour l'objectif de guerre (claim) effectivement sécurisé — compte bien plus qu'un domaine "au hasard" de même poids territorial. */
@@ -216,6 +196,14 @@ const WAR_SCORE_GOAL_BONUS = 20;
 /** Points par bataille rangée gagnée, plafonnés — la progression ne vient pas que des sièges. */
 const WAR_SCORE_PER_BATTLE_WIN = 3;
 const WAR_SCORE_BATTLE_WINS_CAP = 15;
+/**
+ * Jours de possession ininterrompue de l'intégralité du war goal pour, à eux
+ * seuls, faire grimper le score jusqu'à 100 — tenir le territoire disputé
+ * assez longtemps légitime l'occupation même sans anéantir l'adversaire.
+ * Remis à 0 dès qu'un domaine du goal repasse aux mains adverses
+ * (`tickWarGoalOccupation`).
+ */
+const WAR_SCORE_OCCUPATION_DAYS_TO_MAX = 180;
 
 /**
  * Score de guerre signé (−100…100) du point de vue de `viewerId` : essentiellement
@@ -223,15 +211,28 @@ const WAR_SCORE_BATTLE_WINS_CAP = 15;
  * un seul domaine conquis sur un empire de 100 ne vaut pas 100%), plus un bonus
  * pour l'objectif de guerre (claim) spécifiquement sécurisé et pour les batailles
  * rangées gagnées, moins l'équivalent côté adverse. Positif = on l'emporte.
- * `canPressDemands` reste indépendant de ce score : il ne regarde que l'objectif
- * de guerre réellement sécurisé, pas ce pourcentage global.
+ *
+ * Deux voies de victoire totale forcent le score à 100, chacune suffisante à
+ * elle seule (`canPressDemands` exige d'atteindre 100 ici) :
+ * - tout le territoire adverse capturé (même sans avoir gagné/mené la
+ *   moindre bataille rangée) ;
+ * - l'ennemi n'a plus aucune force pour continuer (armées + levées à zéro),
+ *   même si l'occupation du terrain n'a pas suivi (les sièges sont plus
+ *   lents que les batailles gagnées).
+ * Sans ces deux voies, la somme pondérée (territoire 65 + objectif 20 +
+ * batailles 15) exigeait les trois maxées en même temps pour atteindre 100 —
+ * un ennemi anéanti mais pas totalement occupé restait bloqué sous 100 %.
  */
-export function warScorePercent(war: WarState, viewerId: number): number {
+export function warScorePercent(game: GameState, war: WarState, viewerId: number): number {
   const isAttacker = viewerId === war.attackerId;
   const myTotal = isAttacker ? (war.conquestOrder?.length ?? 0) : (war.attackerFrontOrder?.length ?? 0);
   const enemyTotal = isAttacker ? (war.attackerFrontOrder?.length ?? 0) : (war.conquestOrder?.length ?? 0);
   const myCaptured = (isAttacker ? war.capturedByAttacker : war.capturedByDefender)?.length ?? 0;
   const enemyCaptured = (isAttacker ? war.capturedByDefender : war.capturedByAttacker)?.length ?? 0;
+
+  if (myTotal > 0 && myCaptured >= myTotal) return 100;
+  const enemyId = isAttacker ? war.defenderId : war.attackerId;
+  if (sideRemainingPower(game, war.id, enemyId) <= 0) return 100;
 
   const myTerritory = myTotal > 0 ? Math.min(1, myCaptured / myTotal) : 0;
   const enemyTerritory = enemyTotal > 0 ? Math.min(1, enemyCaptured / enemyTotal) : 0;
@@ -253,10 +254,50 @@ export function warScorePercent(war: WarState, viewerId: number): number {
   const myBattleBonus = Math.min(WAR_SCORE_BATTLE_WINS_CAP, myBattleWins * WAR_SCORE_PER_BATTLE_WIN);
   const enemyBattleBonus = Math.min(WAR_SCORE_BATTLE_WINS_CAP, enemyBattleWins * WAR_SCORE_PER_BATTLE_WIN);
 
-  const myScore = myTerritory * WAR_SCORE_TERRITORY_WEIGHT + myGoalBonus + myBattleBonus;
+  // Tenir le war goal en entier, sans interruption, assez longtemps suffit
+  // seul à faire grimper le score à 100 (voir tickWarGoalOccupation).
+  let myOccupationBonus = 0;
+  if (isAttacker && (cb === "claim_province" || cb === "conquest")) {
+    const daysHeld = war.warGoalOccupiedDays ?? 0;
+    myOccupationBonus = Math.min(100, (daysHeld / WAR_SCORE_OCCUPATION_DAYS_TO_MAX) * 100);
+  }
+
+  const myScore = myTerritory * WAR_SCORE_TERRITORY_WEIGHT + myGoalBonus + myBattleBonus + myOccupationBonus;
   const enemyScore = enemyTerritory * WAR_SCORE_TERRITORY_WEIGHT + enemyBattleBonus;
 
   return Math.max(-100, Math.min(100, Math.round(myScore - enemyScore)));
+}
+
+/**
+ * Avance quotidiennement `warGoalOccupiedDays` pour chaque guerre de
+ * claim/conquête où l'attaquant tient l'intégralité du war goal — remis à 0
+ * dès qu'un domaine du goal repasse aux mains adverses (siège perdu).
+ */
+export function tickWarGoalOccupation(game: GameState): void {
+  for (const war of game.wars) {
+    const cb = war.casusBelli ?? "claim_province";
+    if (cb !== "claim_province" && cb !== "conquest") continue;
+    const goalIds = war.warGoalDomainIds?.length ? war.warGoalDomainIds : war.conquestOrder;
+    if (!goalIds?.length) continue;
+    const captured = new Set(war.capturedByAttacker || []);
+    const fullySecured = goalIds.every((id) => captured.has(id));
+    war.warGoalOccupiedDays = fullySecured ? (war.warGoalOccupiedDays ?? 0) + 1 : 0;
+  }
+}
+
+/**
+ * Éligibilité à « appuyer nos exigences » — la barre de score doit avoir
+ * atteint 100, pas avant. Une guerre de claim ne transfère toujours que le
+ * domaine/titre disputé à la résolution (`resolveClaimProvinceVictory`), mais
+ * y parvenir demande maintenant la même barre pleine que n'importe quelle
+ * guerre — batailles gagnées, territoire pris, objectif sécurisé, tout ce qui
+ * alimente `warScorePercent`.
+ */
+export function canPressDemands(game: GameState, war: WarState, actorId: number): PressDemandsCheck {
+  const isAttacker = actorId === war.attackerId;
+  if (!isAttacker && actorId !== war.defenderId) return { ok: false, reason: "Not a party to this war" };
+  if (warScorePercent(game, war, actorId) >= 100) return { ok: true };
+  return { ok: false, reason: "War progress has not reached 100%" };
 }
 
 /** Éligibilité à demander une paix blanche : refusée si l’autre camp n’est pas clairement le plus faible. */
@@ -280,7 +321,7 @@ export function pressDemands(
 ): boolean {
   const war = warOf(game, warId);
   if (!war) return false;
-  const check = canPressDemands(war, actorId);
+  const check = canPressDemands(game, war, actorId);
   if (!check.ok) {
     if (actorId === game.playerId && check.reason) {
       pushLog(game, `Cannot press demands: ${check.reason}.`);

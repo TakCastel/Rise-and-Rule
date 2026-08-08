@@ -1,3 +1,4 @@
+import type { Army } from "./army";
 import { demesneLevyEfficiency, treasuryLevyFactor } from "./demesne";
 import { getGold } from "./economy";
 import { getPossessionDemesneManpower } from "../lib/population";
@@ -31,7 +32,11 @@ export interface VassalLevyShare {
 export interface PowerBreakdown {
   demesne: number;
   fromVassals: number;
-  /** Levées disponibles (après pertes de guerre). */
+  /** Levées disponibles en réserve (après pertes de guerre), hors armées déjà levées. */
+  reserve: number;
+  /** Troupes déjà levées, actuellement en campagne (armées vivantes). */
+  raised: number;
+  /** Force totale = réserve + armées levées. */
   total: number;
   /** Capacité théorique à plein. */
   capacity: number;
@@ -45,12 +50,17 @@ export interface PowerBreakdown {
 
 /**
  * Force levable : demesne (après malus de limite) + part des demesnes vassaux
- * selon leur opinion, le tout écrasé par l’endettement.
+ * selon leur opinion, le tout écrasé par l’endettement — plus les troupes
+ * déjà levées et actuellement en campagne (`armies`), qui ne sont plus dans
+ * la réserve (`manpower`) mais restent une force bien réelle. Sans `armies`,
+ * `total` ne reflète que la réserve — sous-estime la force de quiconque
+ * vient de lever une armée.
  */
 export function possessionPowerBreakdown(
   world: WorldData,
   p: Possession,
   opinions?: Record<string, number>,
+  armies?: Army[],
 ): PowerBreakdown {
   const demesneGross = getPossessionDemesneManpower(world, p).levies;
   const efficiency = demesneLevyEfficiency(p);
@@ -81,7 +91,10 @@ export function possessionPowerBreakdown(
   const capacity = Math.max(0, Math.round(rawTotal * treasuryFactor));
   if (p.manpower == null) p.manpower = capacity;
   else if (p.manpower > capacity) p.manpower = capacity;
-  const total = Math.max(0, Math.round(Math.min(p.manpower, capacity)));
+  const reserve = Math.max(0, Math.round(Math.min(p.manpower, capacity)));
+  const raised = (armies || [])
+    .filter((a) => a.ownerId === p.id)
+    .reduce((s, a) => s + a.troops, 0);
 
   return {
     demesne: Math.round(demesne * treasuryFactor),
@@ -89,7 +102,9 @@ export function possessionPowerBreakdown(
     efficiency,
     treasuryFactor,
     fromVassals: Math.round(fromVassals * treasuryFactor),
-    total,
+    reserve,
+    raised,
+    total: reserve + raised,
     capacity,
     vassals,
   };
@@ -109,8 +124,9 @@ export function possessionPower(
   world: WorldData,
   p: Possession,
   opinions?: Record<string, number>,
+  armies?: Army[],
 ): number {
-  return possessionPowerBreakdown(world, p, opinions).total;
+  return possessionPowerBreakdown(world, p, opinions, armies).total;
 }
 
 export function powerRatio(attacker: number, defender: number): number {

@@ -28,8 +28,11 @@ export function eligibleAlliesToCall(
     war.defenderId,
     ...(war.allyOfAttacker || []),
     ...(war.allyOfDefender || []),
+    ...(war.declinedAllyCalls || []),
   ]);
   const isRebellionWar = war.casusBelli === "depose" || war.casusBelli === "independence";
+  const callerSide = warSideOf(war, callerId);
+  const opposingMainId = callerSide === "attacker" ? war.defenderId : war.attackerId;
   return getAllyIds(game.alliances, callerId).filter((id) => {
     if (already.has(id)) return false;
     // Un vassal ne peut jamais être appelé en renfort dans une guerre
@@ -37,6 +40,16 @@ export function eligibleAlliesToCall(
     // lige, c’est par sa propre rébellion, jamais parce qu’un allié l’y
     // entraîne malgré lui.
     if (isRebellionWar && findPossession(game.world, id)?.liegeId != null) return false;
+    // Un vassal (à quelque niveau que ce soit de sa chaîne féodale) ne peut
+    // jamais être appelé à combattre son propre suzerain, même par un allié
+    // — il reste sous sa tutelle, l’alliance ne rompt pas ce lien.
+    if (callerSide) {
+      let cur = findPossession(game.world, id);
+      while (cur?.liegeId != null) {
+        if (cur.liegeId === opposingMainId) return false;
+        cur = findPossession(game.world, cur.liegeId);
+      }
+    }
     return true;
   });
 }
@@ -120,11 +133,19 @@ function joinWarSide(war: WarState, side: WarSide, allyId: number): void {
   }
 }
 
-function applyDeclinePenalty(game: GameState, decliner: number, caller: number): void {
+function applyDeclinePenalty(
+  game: GameState,
+  war: WarState,
+  decliner: number,
+  caller: number,
+): void {
   const decliningPossession = findPossession(game.world, decliner);
   if (decliningPossession) addPrestige(decliningPossession, -ALLY_CALL_DECLINE_PRESTIGE_COST);
   adjustOpinion(game.opinions, caller, decliner, -10);
   adjustOpinion(game.opinions, decliner, caller, -6);
+  if (!(war.declinedAllyCalls || []).includes(decliner)) {
+    war.declinedAllyCalls = [...(war.declinedAllyCalls || []), decliner];
+  }
 }
 
 /**
@@ -180,10 +201,11 @@ export function callAlly(
     if (callerId === game.playerId) {
       pushNotice(game, `${ally.holderName} answers your call and joins the war.`, {
         title: "Ally joins the war",
+        blocking: false,
       });
     }
   } else {
-    applyDeclinePenalty(game, allyId, callerId);
+    applyDeclinePenalty(game, war, allyId, callerId);
     pushLog(
       game,
       `${ally.holderName} declines ${caller.holderName}'s call to arms (−${formatPrestige(ALLY_CALL_DECLINE_PRESTIGE_COST)} prestige).`,
@@ -192,6 +214,7 @@ export function callAlly(
     if (callerId === game.playerId) {
       pushNotice(game, `${ally.holderName} declines your call to arms.`, {
         title: "Ally refuses to join",
+        blocking: false,
       });
     }
   }
@@ -230,7 +253,7 @@ export function respondAllyCall(
       [request.callerId, actorId],
     );
   } else {
-    applyDeclinePenalty(game, actorId, request.callerId);
+    applyDeclinePenalty(game, war, actorId, request.callerId);
     pushLog(
       game,
       `You decline ${caller.holderName}'s call to arms (−${formatPrestige(ALLY_CALL_DECLINE_PRESTIGE_COST)} prestige).`,
@@ -252,8 +275,9 @@ export function tickAllyCallRequests(game: GameState): void {
     }
     const caller = findPossession(game.world, request.callerId);
     const target = findPossession(game.world, request.targetId);
-    if (caller && target) {
-      applyDeclinePenalty(game, request.targetId, request.callerId);
+    const requestWar = warOf(game, request.warId);
+    if (caller && target && requestWar) {
+      applyDeclinePenalty(game, requestWar, request.targetId, request.callerId);
       pushLog(
         game,
         `${target.holderName} never answers ${caller.holderName}'s call to arms — the moment passes (−${formatPrestige(ALLY_CALL_DECLINE_PRESTIGE_COST)} prestige).`,

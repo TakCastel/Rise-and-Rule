@@ -1968,6 +1968,41 @@ export function partitionDomainsFromCities({
   weldVertices(domains, 5);
   for (const d of domains) d.rings = cleanRings(d.rings);
 
+  // Les sommets côtiers restent épinglés à la grille (pas de 0.034°) pour ne
+  // pas être lissés hors de la terre — ce pas est bien plus grossier que le
+  // littoral fin (`landMask`, simplifié à 0.0025°), d'où un léger décalage
+  // (débordement en mer ou retrait derrière la côte) partout où le tracé réel
+  // est plus détaillé que la grille. On reclippe donc chaque domaine sur le
+  // masque terrestre fin : les arêtes internes (partagées entre domaines,
+  // déjà soudées ci-dessus) restent inchangées — seule la frange côtière,
+  // à la limite du masque, est ajustée pour coller exactement au littoral.
+  console.log("  clip des domaines sur le littoral fin…");
+  for (const d of domains) {
+    if (!d.rings.length) continue;
+    try {
+      const feat =
+        d.rings.length === 1
+          ? turf.polygon([closeRing(d.rings[0])])
+          : turf.multiPolygon(d.rings.map((r) => [closeRing(r)]));
+      const clipped = turf.intersect(turf.featureCollection([feat, landMask]));
+      if (!clipped?.geometry) continue;
+      const g = clipped.geometry;
+      if (g.type === "Polygon") {
+        d.rings = [g.coordinates[0]];
+      } else if (g.type === "MultiPolygon") {
+        // Garde tous les morceaux (une côte découpée peut fragmenter un
+        // domaine en plusieurs îlots) — cleanRings élague ensuite les lames.
+        d.rings = g.coordinates.map((poly) => poly[0]);
+      }
+    } catch {
+      /* garde le contour d'origine (issu de la grille) si le clip échoue */
+    }
+  }
+  // Chaque domaine est clippé indépendamment : ressoude les arêtes internes
+  // partagées, que le clip a pu re-générer avec un point flottant différent.
+  weldVertices(domains, 5);
+  for (const d of domains) d.rings = cleanRings(d.rings);
+
   const out = [];
   const remap = new Map();
   for (let i = 0; i < domains.length; i++) {

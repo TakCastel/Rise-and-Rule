@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { WorldData } from "../types/world";
-import { declareRebellion, declareWar, demandAllegiance, grantDomain, requestAlliance, sendGift, claimProvinceTitle, claimKingdomTitle, renameKingdom, foundImaginaryKingdom, startFabricateDomainClaim, cancelFabricateDomainClaim } from "./actions";
+import type { PossessionFocus, WorldData } from "../types/world";
+import { declareRebellion, declareWar, demandAllegiance, grantDomain, cedeProvinceTitle, requestAlliance, respondAllegianceDemand, sendGift, claimProvinceTitle, claimKingdomTitle, renameKingdom, setPossessionFocus, foundImaginaryKingdom, startFabricateDomainClaim, cancelFabricateDomainClaim } from "./actions";
 import {
   mergeArmies,
   orderMarch,
@@ -22,12 +22,24 @@ import {
   worldFingerprint,
   type SaveInfo,
 } from "./save";
-import { tickFrame } from "./tick";
+import { tickFrame, tickIntervalMs } from "./tick";
 import { getPlayer, pushLog, type GameSpeed, type GameState } from "./types";
 
-/** Une notice modale vient d'apparaître : force la pause tant qu'elle n'est pas acquittée. */
+/**
+ * Une notice modale bloquante ou une demande d'allégeance (popup) vient
+ * d'apparaître : force la pause tant qu'elle n'est pas acquittée. Une
+ * demande d'allégeance n'est jamais mise en file que pour le joueur (voir
+ * `demandAllegiance`), donc toute nouvelle entrée le concerne forcément.
+ */
 function pauseForNewNotices(prev: GameState, next: GameState): GameState {
-  if (next.playing && next.notices.length > (prev.notices?.length ?? 0)) {
+  if (!next.playing) return next;
+  const prevNoticeCount = prev.notices?.length ?? 0;
+  const newNotices =
+    next.notices.length > prevNoticeCount ? next.notices.slice(prevNoticeCount) : [];
+  const hasBlockingNotice = newNotices.some((n) => n.blocking !== false);
+  const hasNewAllegianceDemand =
+    (next.allegianceDemands?.length ?? 0) > (prev.allegianceDemands?.length ?? 0);
+  if (hasBlockingNotice || hasNewAllegianceDemand) {
     return { ...next, playing: false };
   }
   return next;
@@ -52,6 +64,7 @@ function cloneMutable(g: GameState): GameState {
       capturedByDefender: [...(w.capturedByDefender || [])],
       allyOfAttacker: w.allyOfAttacker ? [...w.allyOfAttacker] : undefined,
       allyOfDefender: w.allyOfDefender ? [...w.allyOfDefender] : undefined,
+      declinedAllyCalls: w.declinedAllyCalls ? [...w.declinedAllyCalls] : undefined,
       warGoalDomainIds: w.warGoalDomainIds
         ? [...w.warGoalDomainIds]
         : undefined,
@@ -64,9 +77,12 @@ function cloneMutable(g: GameState): GameState {
     nextArmyId: g.nextArmyId ?? 1,
     opinions: { ...g.opinions },
     giftsSent: { ...g.giftsSent },
+    warTruces: { ...g.warTruces },
     alliances: [...(g.alliances || [])],
     allyCallRequests: (g.allyCallRequests || []).map((r) => ({ ...r })),
     nextAllyCallRequestId: g.nextAllyCallRequestId ?? 1,
+    allegianceDemands: (g.allegianceDemands || []).map((r) => ({ ...r })),
+    nextAllegianceDemandId: g.nextAllegianceDemandId ?? 1,
     notices: [...(g.notices || [])],
     nextNoticeId: g.nextNoticeId ?? 1,
     log: [...g.log],
@@ -108,11 +124,22 @@ export function useGame(template: WorldData | null) {
       // un module non-composant (logique de jeu) est édité en dev — sauf si
       // world.json a changé entretemps (empreinte différente), auquel cas
       // l'autosave est périmée et on repart d'une partie neuve.
+      // `cancelled` protège contre le double-appel volontaire de StrictMode
+      // en dev : sans lui, deux lectures de l'autosave se chevauchent — la
+      // première peut déjà avoir tické (nouvelles armées levées) quand la
+      // seconde écrase avec un instantané plus vieux, remettant `nextArmyId`
+      // en arrière ; la boucle de jeu (toujours en cours) réutilise alors un
+      // id déjà pris pour la prochaine armée → deux armées avec le même id
+      // (React se plaint de clés dupliquées `army-N` sur la carte).
+      let cancelled = false;
       loadDevAutosave(worldFingerprint(template)).then((restored) => {
+        if (cancelled) return;
         setGame(restored ?? createGame(template));
         void refreshSaveInfo();
       });
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
     setGame(createGame(template));
     void refreshSaveInfo();
@@ -140,7 +167,11 @@ export function useGame(template: WorldData | null) {
     /** Cadence de rendu du monde, indépendante de la vitesse de jeu : assez
      * fine pour que les armées en marche glissent de façon linéaire au lieu
      * d’avancer par à-coups d’un jour entier. `tickFrame` gère lui-même le
-     * sous-jour (dayProgress) et les rollovers multi-jours si besoin. */
+     * sous-jour (dayProgress) et les rollovers multi-jours si besoin.
+     * Uniquement utile tant qu’une armée est en marche (glissé à interpoler) —
+     * sinon on ne force `setGame` (donc un re-render complet de l’appli) qu’au
+     * rythme du jour calendaire : sans ça, un `setGame` à 20/s en continu même
+     * sans armée sur la carte re-rendait toute l’UI pour rien. */
     const UPDATE_MS = 50;
 
     let raf = 0;
@@ -158,7 +189,9 @@ export function useGame(template: WorldData | null) {
       }
 
       acc += dt;
-      if (acc >= UPDATE_MS) {
+      const hasMovingArmies = g.armies.some((a) => a.stance === "moving");
+      const threshold = hasMovingArmies ? UPDATE_MS : tickIntervalMs(g.speed);
+      if (acc >= threshold) {
         const elapsed = acc;
         acc = 0;
         setGame((cur) => (cur ? pauseForNewNotices(cur, tickFrame(cur, elapsed)) : cur));
@@ -298,6 +331,15 @@ export function useGame(template: WorldData | null) {
     });
   }, []);
 
+  const doCedeProvinceTitle = useCallback((provinceId: number, vassalId: number) => {
+    setGame((g) => {
+      if (!g) return g;
+      const next = cloneMutable(g);
+      cedeProvinceTitle(next, provinceId, vassalId);
+      return { ...next };
+    });
+  }, []);
+
   const doRebel = useCallback((mode: "depose" | "independence") => {
     setGame((g) => {
       if (!g) return g;
@@ -330,6 +372,15 @@ export function useGame(template: WorldData | null) {
       if (!g) return g;
       const next = cloneMutable(g);
       renameKingdom(next, royaumeId, name);
+      return { ...next };
+    });
+  }, []);
+
+  const doSetFocus = useCallback((focus: PossessionFocus) => {
+    setGame((g) => {
+      if (!g) return g;
+      const next = cloneMutable(g);
+      setPossessionFocus(next, focus);
       return { ...next };
     });
   }, []);
@@ -451,6 +502,15 @@ export function useGame(template: WorldData | null) {
     });
   }, []);
 
+  const doRespondAllegianceDemand = useCallback((requestId: number, accept: boolean) => {
+    setGame((g) => {
+      if (!g) return g;
+      const next = cloneMutable(g);
+      respondAllegianceDemand(next, requestId, accept);
+      return { ...next };
+    });
+  }, []);
+
   return {
     game,
     player: game ? getPlayer(game) : null,
@@ -469,10 +529,12 @@ export function useGame(template: WorldData | null) {
     doAlliance,
     doGift,
     doGrant,
+    doCedeProvinceTitle,
     doRebel,
     doClaimProvince,
     doClaimKingdom,
     doRenameKingdom,
+    doSetFocus,
     doFoundKingdom,
     doFabricateClaim,
     doCancelFabricateClaim,
@@ -485,6 +547,7 @@ export function useGame(template: WorldData | null) {
     doPressDemands,
     doCallAlly,
     doRespondAllyCall,
+    doRespondAllegianceDemand,
     doDismissNotice,
   };
 }

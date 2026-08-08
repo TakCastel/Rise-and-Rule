@@ -6,13 +6,21 @@ import {
   demesnePenaltyPercent,
 } from "../game/demesne";
 import { formatGold, possessionIncomeBreakdown } from "../game/economy";
+import { FOCUS_BONUS, FOCUS_PENALTY } from "../game/focus";
 import { possessionPower, possessionPowerBreakdown } from "../game/power";
 import type { SaveInfo } from "../game/save";
 import { formatDate } from "../game/tick";
 import { isChronicleRelevant, type GameState } from "../game/types";
 import { realmDisplayName, titlesHeldBy, type Title } from "../game/titles";
-import type { Possession, WorldData } from "../types/world";
+import type { Possession, PossessionFocus, WorldData } from "../types/world";
 import { cn } from "@/lib/utils";
+import { CollapsibleSection } from "./CollapsibleSection";
+
+const FOCUS_OPTIONS: { id: PossessionFocus; label: string }[] = [
+  { id: "economy", label: "Economy" },
+  { id: "war", label: "War" },
+  { id: "prestige", label: "Legacy" },
+];
 
 interface GameMenuProps {
   templateReady: boolean;
@@ -29,6 +37,7 @@ interface GameMenuProps {
   onMainMenu: () => void;
   onPlayAnyoneChange: (value: boolean) => void;
   onHover: (id: number | null) => void;
+  onSetFocus: (focus: PossessionFocus) => void;
 }
 
 export function GameMenu({
@@ -46,12 +55,13 @@ export function GameMenu({
   onMainMenu,
   onPlayAnyoneChange,
   onHover,
+  onSetFocus,
 }: GameMenuProps) {
   if (!templateReady || !game) {
     return (
       <div className="panel">
         <div className="panel-level">Menu</div>
-        <h2>Strateclo</h2>
+        <h2>Rise and Rule</h2>
         <p className="panel-muted">Loading board…</p>
       </div>
     );
@@ -131,10 +141,12 @@ export function GameMenu({
   }
 
   const powerBreakdown = player
-    ? possessionPowerBreakdown(game.world, player, game.opinions)
+    ? possessionPowerBreakdown(game.world, player, game.opinions, game.armies)
     : null;
   const allyLevies = player
-    ? Math.round(allyTroopContribution(game.world, player, game.opinions, game.alliances))
+    ? Math.round(
+        allyTroopContribution(game.world, player, game.opinions, game.alliances, game.armies),
+      )
     : 0;
 
   const powerLabel = powerBreakdown
@@ -191,6 +203,28 @@ export function GameMenu({
       )}
 
       {player && (
+        <div className="game-menu-focus">
+          <div className="game-menu-focus-title">Focus</div>
+          <div className="game-menu-focus-buttons">
+            {FOCUS_OPTIONS.map(({ id, label }) => (
+              <button
+                key={id}
+                type="button"
+                className={cn("game-menu-focus-btn", player.focus === id && "active")}
+                onClick={() => onSetFocus(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="panel-muted game-menu-focus-hint">
+            +{Math.round(FOCUS_BONUS * 100)}% to the chosen focus, −
+            {Math.round(FOCUS_PENALTY * 100)}% to the other two.
+          </p>
+        </div>
+      )}
+
+      {player && (
         <HoldingsSection
           world={game.world}
           player={player}
@@ -200,19 +234,20 @@ export function GameMenu({
 
       {saveStatus && <p className="game-save-status">{saveStatus}</p>}
 
-      <h3>Chronicle</h3>
-      {chronicle.length === 0 ? (
-        <p className="panel-muted">Nothing yet.</p>
-      ) : (
-        <ul className="game-log">
-          {chronicle.map((e) => (
-            <li key={e.id}>
-              <span className="game-log-year">{e.year}</span>
-              <span>{e.text}</span>
-            </li>
-          ))}
-        </ul>
-      )}
+      <CollapsibleSection title="Chronicle" count={chronicle.length}>
+        {chronicle.length === 0 ? (
+          <p className="panel-muted">Nothing yet.</p>
+        ) : (
+          <ul className="game-log">
+            {chronicle.map((e) => (
+              <li key={e.id}>
+                <span className="game-log-year">{e.year}</span>
+                <span>{e.text}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CollapsibleSection>
     </div>
   );
 }
@@ -241,46 +276,49 @@ function HoldingsSection({
 
   return (
     <>
-      <h3>Domains</h3>
-      {domains.length === 0 ? (
-        <p className="panel-muted">No domains held.</p>
-      ) : (
-        <ul className="game-menu-titles-list">
-          {domains.map((d) => (
-            <li key={d.id}>
-              <span className="game-menu-titles-name">{d.name}</span>
-              <span className="game-menu-titles-tier">
-                +{formatGold(d.income)}/mo
-              </span>
-            </li>
-          ))}
-        </ul>
+      <CollapsibleSection title="Domains" count={domains.length} defaultOpen>
+        {domains.length === 0 ? (
+          <p className="panel-muted">No domains held.</p>
+        ) : (
+          <ul className="game-menu-titles-list">
+            {domains.map((d, i) => (
+              <li key={d.id}>
+                <span className="game-menu-titles-name">
+                  {d.name}
+                  {/* Domaines déjà triés par revenu décroissant : le premier est la capitale (le plus riche). */}
+                  {i === 0 && <span className="game-menu-capital-tag">Capital</span>}
+                </span>
+                <span className="game-menu-titles-tier">
+                  +{formatGold(d.income)}/mo
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CollapsibleSection>
+
+      {provinces.length > 0 && (
+        <CollapsibleSection title="Provinces" count={provinces.length}>
+          <ul className="game-menu-titles-list">
+            {provinces.map((t) => (
+              <li key={t.id}>
+                <span className="game-menu-titles-name">{t.name}</span>
+              </li>
+            ))}
+          </ul>
+        </CollapsibleSection>
       )}
 
-      <h3>Provinces</h3>
-      {provinces.length === 0 ? (
-        <p className="panel-muted">No province titles held.</p>
-      ) : (
-        <ul className="game-menu-titles-list">
-          {provinces.map((t) => (
-            <li key={t.id}>
-              <span className="game-menu-titles-name">{t.name}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      <h3>Kingdoms</h3>
-      {kingdoms.length === 0 ? (
-        <p className="panel-muted">No kingdom title held.</p>
-      ) : (
-        <ul className="game-menu-titles-list">
-          {kingdoms.map((t) => (
-            <li key={t.id}>
-              <span className="game-menu-titles-name">{t.name}</span>
-            </li>
-          ))}
-        </ul>
+      {kingdoms.length > 0 && (
+        <CollapsibleSection title="Kingdoms" count={kingdoms.length}>
+          <ul className="game-menu-titles-list">
+            {kingdoms.map((t) => (
+              <li key={t.id}>
+                <span className="game-menu-titles-name">{t.name}</span>
+              </li>
+            ))}
+          </ul>
+        </CollapsibleSection>
       )}
     </>
   );
@@ -302,7 +340,7 @@ function MainMenuPanel({
   return (
     <div className="panel game-menu">
       <div className="panel-level">Main menu</div>
-      <h2>Strateclo</h2>
+      <h2>Rise and Rule</h2>
       <p className="panel-muted">
         Western Europe around 486. Rule a kingdom, raise levies, and reshape the map.
       </p>

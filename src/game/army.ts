@@ -1,13 +1,14 @@
-import type { Domaine, TerrainType, WorldData } from "../types/world";
+import type { Domaine, Possession, TerrainType, WorldData } from "../types/world";
 import { areAllied } from "./alliance";
 import { controlsDomain } from "./titles";
-import { addGold, formatGold } from "./economy";
+import { addGold, domainMonthlyIncome, formatGold } from "./economy";
+import { warFocusMultiplier } from "./focus";
 import { levyCapacity } from "./power";
 import type { GameState, WarState } from "./types";
 import { pushLog } from "./types";
 import { findPossession } from "./war";
 
-export type ArmyStance = "idle" | "moving" | "sieging" | "battling";
+export type ArmyStance = "idle" | "moving" | "sieging" | "battling" | "routing";
 
 /**
  * Corps d’armée levé pour une guerre précise. `domainId` est le domaine
@@ -38,8 +39,26 @@ export interface Army {
   raisedDay: number;
 }
 
+/**
+ * Index id → domaine, mis en cache par référence de `world.domaines` (une
+ * nouvelle référence = un nouvel index construit une seule fois, réutilisé
+ * ensuite pour tous les lookups tant que ce tableau ne change pas). Sans ça,
+ * `domainById` — appelé des milliers de fois par tick de jeu (voisinage,
+ * guerre, marche…) — faisait un scan linéaire des ~700+ domaines à chaque
+ * appel, dominant très largement le coût CPU en jeu.
+ */
+const domainIndexCache = new WeakMap<Domaine[], Map<number, Domaine>>();
+function domainIndex(domaines: Domaine[]): Map<number, Domaine> {
+  let idx = domainIndexCache.get(domaines);
+  if (!idx) {
+    idx = new Map(domaines.map((d) => [d.id, d]));
+    domainIndexCache.set(domaines, idx);
+  }
+  return idx;
+}
+
 export function domainById(world: WorldData, id: number): Domaine | undefined {
-  return world.domaines.find((x) => x.id === id) ?? world.domaines[id];
+  return domainIndex(world.domaines).get(id) ?? world.domaines[id];
 }
 
 export type WarSide = "attacker" | "defender";
@@ -199,6 +218,25 @@ function nearestFriendlyDomain(
   return undefined;
 }
 
+/**
+ * Capitale d'une possession : le domaine le plus riche de son demesne
+ * (revenu mensuel le plus élevé) — recalculée à la volée, elle change
+ * automatiquement si un autre domaine devient plus rentable (nouveau
+ * domaine acquis, développement qui progresse…). C'est là que les levées
+ * sont rassemblées et où une armée en déroute revient se regrouper.
+ */
+export function capitalDomainId(world: WorldData, actor: Possession): number | undefined {
+  if (!actor.domaines?.length) return undefined;
+  let best: { id: number; score: number } | undefined;
+  for (const id of actor.domaines) {
+    const d = domainById(world, id);
+    if (!d) continue;
+    const score = domainMonthlyIncome(d);
+    if (!best || score > best.score) best = { id, score };
+  }
+  return best?.id ?? actor.domaines[0];
+}
+
 // ---------------------------------------------------------------------------
 // Sièges
 // ---------------------------------------------------------------------------
@@ -249,7 +287,7 @@ export function siegeDefenseStrength(domain: Domaine): number {
 export const BATTLE_DAILY_CASUALTY_RATE = 0.06;
 export const BATTLE_RETREAT_FRACTION = 0.2;
 export const ARMY_MIN_TROOPS = 50;
-export const ARMY_DISBAND_RETURN_FRACTION = 0.5;
+export const ARMY_DISBAND_RETURN_FRACTION = 0.7;
 /** Fraction du manpower encore en réserve qui survit à une défaite écrasante (armée anéantie). */
 export const BATTLE_DEFEAT_MANPOWER_FACTOR = 0.15;
 
@@ -329,9 +367,22 @@ function handleArrival(game: GameState, army: Army): void {
     return;
   }
   const enemySide = opposingSideId(war, army.ownerId);
-  const myCaptured = warSideOf(war, army.ownerId) === "attacker" ? war.capturedByAttacker : war.capturedByDefender;
+  const mySide = warSideOf(war, army.ownerId);
+  const myCaptured = mySide === "attacker" ? war.capturedByAttacker : war.capturedByDefender;
+  // Liste de l'adversaire : un domaine qui m'appartient légitimement mais
+  // que l'ennemi a pris par siège y figure — la propriété politique
+  // (`possessionId`) ne change jamais en cours de guerre (voir
+  // `progressSieges`), donc `controlsDomain` seul ne détecte pas cette
+  // occupation militaire. Sans ce second cas, reprendre pied sur son propre
+  // domaine occupé ne déclenchait aucun siège : l'armée s'y posait « idle »
+  // sans jamais faire tomber le flag d'occupation ennemi.
+  const enemyCaptured = mySide === "attacker" ? war.capturedByDefender : war.capturedByAttacker;
   const alreadyOccupiedByMe = (myCaptured || []).includes(domain.id);
-  if (!alreadyOccupiedByMe && controlsDomain(game.world, enemySide, domain.possessionId)) {
+  const enemyOccupiesHere = (enemyCaptured || []).includes(domain.id);
+  if (
+    !alreadyOccupiedByMe &&
+    (controlsDomain(game.world, enemySide, domain.possessionId) || enemyOccupiesHere)
+  ) {
     army.stance = "sieging";
     army.siegeProgress = 0;
     army.siegeDays = siegeDaysFor(domain);
@@ -412,9 +463,26 @@ function interceptCrossingMarches(game: GameState): void {
   }
 }
 
+/** Étape suivante d'une déroute, ou arrivée (regroupement, contrôle rendu au joueur). */
+function advanceRoutingLeg(game: GameState, army: Army): void {
+  if (army.path && army.path.length) {
+    const next = army.path[0];
+    army.legDays = legDaysBetween(game.world, army.domainId, next);
+    army.legProgress = 0;
+    army.stance = "routing";
+    return;
+  }
+  army.stance = "idle";
+  army.path = undefined;
+  army.legDays = undefined;
+  army.legProgress = undefined;
+  const owner = findPossession(game.world, army.ownerId);
+  pushLog(game, `${owner?.holderName ?? "An army"} regroups after its retreat.`, [army.ownerId]);
+}
+
 function advanceMarches(game: GameState): void {
   for (const army of game.armies) {
-    if (army.stance !== "moving") continue;
+    if (army.stance !== "moving" && army.stance !== "routing") continue;
     army.legProgress = (army.legProgress ?? 0) + 1;
     if ((army.legProgress ?? 0) < (army.legDays ?? 1)) continue;
     const arrivedId = army.path?.shift();
@@ -424,7 +492,11 @@ function advanceMarches(game: GameState): void {
       continue;
     }
     army.domainId = arrivedId;
-    handleArrival(game, army);
+    if (army.stance === "routing") {
+      advanceRoutingLeg(game, army);
+    } else {
+      handleArrival(game, army);
+    }
   }
 }
 
@@ -551,13 +623,23 @@ function progressSieges(game: GameState): void {
     // pas réellement de mains — le transfert n’a lieu qu’à la résolution de
     // la guerre (« appuyer nos exigences »), et seulement pour les domaines
     // du war goal (claim). `capturedByAttacker/Defender` sert d’état
-    // d’occupation, pas d’historique de transferts déjà faits.
+    // d’occupation, pas d’historique de transferts déjà faits. Reprendre un
+    // domaine que l’adversaire occupait le retire de SA liste — sinon il
+    // resterait compté comme sien dans les deux camps à la fois.
     if (warSideOf(war, army.ownerId) === "attacker") {
       if (!war.capturedByAttacker.includes(domain.id)) {
         war.capturedByAttacker = [...war.capturedByAttacker, domain.id];
       }
-    } else if (!war.capturedByDefender.includes(domain.id)) {
-      war.capturedByDefender = [...war.capturedByDefender, domain.id];
+      if (war.capturedByDefender.includes(domain.id)) {
+        war.capturedByDefender = war.capturedByDefender.filter((id) => id !== domain.id);
+      }
+    } else {
+      if (!war.capturedByDefender.includes(domain.id)) {
+        war.capturedByDefender = [...war.capturedByDefender, domain.id];
+      }
+      if (war.capturedByAttacker.includes(domain.id)) {
+        war.capturedByAttacker = war.capturedByAttacker.filter((id) => id !== domain.id);
+      }
     }
     pushLog(
       game,
@@ -589,6 +671,14 @@ function exitBattle(game: GameState, army: Army): void {
   }
 }
 
+/**
+ * Une armée en déroute (`routing`) fuit vers sa capitale au lieu de « pop »
+ * directement chez elle : elle marche réellement (mêmes étapes/`legDays`
+ * qu’une marche normale) et reste hors de contrôle du joueur tant qu’elle
+ * n’est pas arrivée — `orderMarch` rejette tout ordre sur une armée dans cet
+ * état. Sans route dégagée (encerclée, mer sans navires…), repli d’urgence
+ * sur le domaine ami le plus proche à la place.
+ */
 function maybeRetreat(game: GameState, survivors: Army[]): void {
   if (!survivors.length) return;
   const startTotal = survivors.reduce((s, a) => s + (a.battleStartTroops ?? a.troops), 0);
@@ -596,23 +686,44 @@ function maybeRetreat(game: GameState, survivors: Army[]): void {
   if (startTotal <= 0 || nowTotal / startTotal >= BATTLE_RETREAT_FRACTION) return;
 
   const fromDomainId = survivors[0].domainId;
-  const dest = nearestFriendlyDomain(game.world, fromDomainId, survivors[0].ownerId);
-  for (const a of survivors) {
-    a.stance = "idle";
-    a.path = undefined;
-    a.siegeProgress = undefined;
-    a.siegeDays = undefined;
-    a.battleOpponentIds = undefined;
-    a.battleStartTroops = undefined;
-    if (dest != null) a.domainId = dest;
-  }
   const domainName = domainById(game.world, fromDomainId)?.name ?? "the field";
-  const ownerName = findPossession(game.world, survivors[0].ownerId)?.holderName ?? "An army";
-  pushLog(
-    game,
-    `${ownerName} routs from ${domainName} and retreats.`,
-    survivors.map((a) => a.ownerId),
-  );
+
+  const byOwner = new Map<number, Army[]>();
+  for (const a of survivors) {
+    const list = byOwner.get(a.ownerId) ?? [];
+    list.push(a);
+    byOwner.set(a.ownerId, list);
+  }
+
+  for (const [ownerId, ownerArmies] of byOwner) {
+    const owner = findPossession(game.world, ownerId);
+    const home = owner ? capitalDomainId(game.world, owner) : undefined;
+    const path =
+      home != null && home !== fromDomainId
+        ? findMarchPath(game.world, fromDomainId, home)
+        : null;
+    const fallback = path?.length ? null : nearestFriendlyDomain(game.world, fromDomainId, ownerId);
+
+    for (const a of ownerArmies) {
+      a.battleOpponentIds = undefined;
+      a.battleStartTroops = undefined;
+      a.siegeProgress = undefined;
+      a.siegeDays = undefined;
+      a.path = undefined;
+      a.legDays = undefined;
+      a.legProgress = undefined;
+      if (path?.length) {
+        a.stance = "routing";
+        a.path = [...path];
+        a.legDays = legDaysBetween(game.world, a.domainId, path[0]);
+        a.legProgress = 0;
+      } else {
+        a.stance = "idle";
+        if (fallback != null) a.domainId = fallback;
+      }
+    }
+    pushLog(game, `${owner?.holderName ?? "An army"} routs from ${domainName} and flees.`, [ownerId]);
+  }
 }
 
 /**
@@ -639,15 +750,27 @@ function resolveBattles(game: GameState): void {
     }
 
     const totals = new Map<number, number>();
+    // Effectif brut (répartition des pertes) et effectif « offensif » (dégâts
+    // infligés aux autres factions, pondéré par le focus guerre de chaque
+    // propriétaire) — distincts : le focus guerre frappe plus fort sans pour
+    // autant encaisser moins, ni fausser les effectifs utilisés ailleurs.
+    const offensiveTotals = new Map<number, number>();
     for (const [root, members] of factions) {
       totals.set(root, members.reduce((s, a) => s + a.troops, 0));
+      offensiveTotals.set(
+        root,
+        members.reduce(
+          (s, a) => s + a.troops * warFocusMultiplier(findPossession(game.world, a.ownerId)),
+          0,
+        ),
+      );
     }
-    const grandTotal = [...totals.values()].reduce((s, t) => s + t, 0);
+    const grandOffensiveTotal = [...offensiveTotals.values()].reduce((s, t) => s + t, 0);
 
     for (const [root, members] of factions) {
       const mine = totals.get(root) ?? 0;
-      const enemyTotal = grandTotal - mine;
-      applyCasualties(members, mine, Math.round(BATTLE_DAILY_CASUALTY_RATE * enemyTotal));
+      const enemyOffensiveTotal = grandOffensiveTotal - (offensiveTotals.get(root) ?? 0);
+      applyCasualties(members, mine, Math.round(BATTLE_DAILY_CASUALTY_RATE * enemyOffensiveTotal));
     }
 
     for (const a of list) {

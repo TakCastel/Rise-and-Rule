@@ -108,8 +108,8 @@ function hash01(n: number): number {
 /** Force de campagne = demesne/vassaux + alliés. */
 function campaignPower(game: GameState, p: Possession): number {
   return (
-    possessionPower(game.world, p, game.opinions) +
-    allyTroopContribution(game.world, p, game.opinions, game.alliances)
+    possessionPower(game.world, p, game.opinions, game.armies) +
+    allyTroopContribution(game.world, p, game.opinions, game.alliances, game.armies)
   );
 }
 

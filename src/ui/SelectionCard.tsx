@@ -45,6 +45,7 @@ import {
 import type { GameState } from "../game/types";
 import { formatCount as formatPower } from "../lib/population";
 import { TERRAIN_PALETTE, developmentColor, getPanelInfo } from "../map/levels";
+import { CollapsibleSection } from "./CollapsibleSection";
 import {
   LEVY_RATE,
   formatCount,
@@ -218,7 +219,7 @@ function CharacterCard({
   );
 
   const demesne = getPossessionDemesneManpower(world, possession);
-  const host = possessionPowerBreakdown(world, possession, game?.opinions);
+  const host = possessionPowerBreakdown(world, possession, game?.opinions, game?.armies);
   const hasVassals = host.vassals.length > 0;
   const income = possessionIncomeBreakdown(world, possession);
   const treasury = getGold(possession);
@@ -561,8 +562,7 @@ function CharacterCard({
         </div>
 
         {vassals.length > 0 && (
-          <section className="selection-list-block">
-            <h3>Vassals</h3>
+          <CollapsibleSection title="Vassals" count={vassals.length}>
             <ul>
               {vassals.map((v) => {
                 const share = host.vassals.find((s) => s.id === v!.id);
@@ -594,12 +594,11 @@ function CharacterCard({
                 );
               })}
             </ul>
-          </section>
+          </CollapsibleSection>
         )}
 
         {allies.length > 0 && (
-          <section className="selection-list-block">
-            <h3>Allies</h3>
+          <CollapsibleSection title="Allies" count={allies.length}>
             <ul>
               {allies.map((a) => (
                 <li key={a!.id}>
@@ -618,12 +617,11 @@ function CharacterCard({
                 </li>
               ))}
             </ul>
-          </section>
+          </CollapsibleSection>
         )}
 
         {heldProvinceTitles.length > 0 && (
-          <section className="selection-list-block">
-            <h3>Provinces</h3>
+          <CollapsibleSection title="Provinces" count={heldProvinceTitles.length}>
             <ul>
               {heldProvinceTitles.map((t) => (
                 <li key={t.id}>
@@ -639,12 +637,11 @@ function CharacterCard({
                 </li>
               ))}
             </ul>
-          </section>
+          </CollapsibleSection>
         )}
 
         {heldKingdomTitles.length > 0 && (
-          <section className="selection-list-block">
-            <h3>Kingdoms</h3>
+          <CollapsibleSection title="Kingdoms" count={heldKingdomTitles.length}>
             <ul>
               {heldKingdomTitles.map((t) => (
                 <li key={t.id}>
@@ -660,12 +657,11 @@ function CharacterCard({
                 </li>
               ))}
             </ul>
-          </section>
+          </CollapsibleSection>
         )}
 
         {claimedTitles.length > 0 && (
-          <section className="selection-list-block">
-            <h3>Claims</h3>
+          <CollapsibleSection title="Claims" count={claimedTitles.length}>
             <ul>
               {claimedTitles.map((t) => {
                 const holder =
@@ -693,7 +689,7 @@ function CharacterCard({
                 );
               })}
             </ul>
-          </section>
+          </CollapsibleSection>
         )}
 
         {isPlayer && game?.phase === "play" && (
@@ -707,8 +703,7 @@ function CharacterCard({
         )}
 
         {isPlayer && income.domains.length > 0 && (
-          <section className="selection-list-block">
-            <h3>Domains</h3>
+          <>
             {game?.phase === "play" && demesneOverage(possession) > 0 && (
               <p className="panel-muted" style={{ marginTop: 0 }}>
                 Over demesne limit (−{demesnePenaltyPercent(possession)}%
@@ -716,6 +711,7 @@ function CharacterCard({
                 or your treasury — and levies — will collapse.
               </p>
             )}
+            <CollapsibleSection title="Domains" count={income.domains.length}>
             <ul>
               {income.domains.map((d) => {
                 const canCreate =
@@ -783,7 +779,8 @@ function CharacterCard({
                 );
               })}
             </ul>
-          </section>
+            </CollapsibleSection>
+          </>
         )}
 
         <footer className="selection-card-foot">
@@ -1588,8 +1585,7 @@ function TerritoryCard({
         )}
 
         {selection.level === "royaume" && memberProvinces.length > 0 && (
-          <section className="selection-list-block">
-            <h3>Provinces</h3>
+          <CollapsibleSection title="Provinces" count={memberProvinces.length}>
             <ul>
               {memberProvinces.map((p) => (
                 <li key={p!.id}>
@@ -1600,12 +1596,11 @@ function TerritoryCard({
                 </li>
               ))}
             </ul>
-          </section>
+          </CollapsibleSection>
         )}
 
         {selection.level === "province" && memberDomains.length > 0 && (
-          <section className="selection-list-block">
-            <h3>Domains</h3>
+          <CollapsibleSection title="Domains" count={memberDomains.length}>
             <ul>
               {memberDomains.map((d) => (
                 <li key={d!.id}>
@@ -1615,7 +1610,7 @@ function TerritoryCard({
                 </li>
               ))}
             </ul>
-          </section>
+          </CollapsibleSection>
         )}
 
         {footParts.length > 0 && (

@@ -1,5 +1,5 @@
-import type { Possession, WorldData } from "../types/world";
-import { PROVINCE_CLAIM_THRESHOLD } from "./titles";
+import type { Possession } from "../types/world";
+import type { Title } from "./titles";
 
 /** Domaines tenus en demesne direct sans malus. */
 export const DEMESNE_LIMIT = 5;
@@ -78,39 +78,17 @@ export function demesnePenaltyPercent(p: Possession): number {
 }
 
 /**
- * Provinces substantiellement tenues en demesne direct par `p` (> 2/3 des
- * domaines de la province détenus en propre). Un simple domaine isolé dans
- * une province qu'on ne contrôle pas vraiment ne compte pas comme
- * « une province de plus » — même seuil que pour revendiquer un titre de
- * province (`PROVINCE_CLAIM_THRESHOLD`).
+ * Provinces dont `p` détient le titre de jure — indépendant des domaines
+ * réellement tenus dans la province (un titre peut rester acquis même sans
+ * plus aucun domaine dedans, ex. tous délégués à des vassaux).
  */
-export function demesneProvinceIds(world: WorldData, p: Possession): Set<number> {
-  const heldSet = new Set(p.domaines || []);
-  const touchedProvinceIds = new Set<number>();
-  for (const did of heldSet) {
-    const d = world.domaines.find((x) => x.id === did) ?? world.domaines[did];
-    if (d?.provinceId != null) touchedProvinceIds.add(d.provinceId);
-  }
-  const ids = new Set<number>();
-  for (const provinceId of touchedProvinceIds) {
-    const province = (world.provinces || []).find((pr) => pr.id === provinceId);
-    const domainIds = province?.domaines?.length
-      ? province.domaines
-      : world.domaines.filter((d) => d.provinceId === provinceId).map((d) => d.id);
-    if (!domainIds.length) continue;
-    const directCount = domainIds.filter((id) => heldSet.has(id)).length;
-    if (directCount / domainIds.length > PROVINCE_CLAIM_THRESHOLD) ids.add(provinceId);
-  }
-  return ids;
+export function provinceTitleIds(titles: Title[], p: Possession): number[] {
+  return titles.filter((t) => t.tier === "province" && t.holderId === p.id).map((t) => t.deJureId);
 }
 
-export function demesneProvinceCount(world: WorldData, p: Possession): number {
-  return demesneProvinceIds(world, p).size;
-}
-
-/** Provinces en trop au-delà de `PROVINCE_DEMESNE_LIMIT`. */
-export function provinceOverage(world: WorldData, p: Possession): number {
-  return Math.max(0, demesneProvinceCount(world, p) - PROVINCE_DEMESNE_LIMIT);
+/** Provinces en trop au-delà de `PROVINCE_DEMESNE_LIMIT` titres détenus. */
+export function provinceOverage(titles: Title[], p: Possession): number {
+  return Math.max(0, provinceTitleIds(titles, p).length - PROVINCE_DEMESNE_LIMIT);
 }
 
 /**

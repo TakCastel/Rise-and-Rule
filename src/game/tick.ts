@@ -4,7 +4,8 @@ import { executeAiPlan, planAiDayActions } from "./ai";
 import { tickArmies } from "./army";
 import { runAiWarConduct } from "./aiWar";
 import { tickAllyCallRequests } from "./ally-war";
-import { declareRebellion, isInvolvedInWar, tickClaimFabrications } from "./actions";
+import { tickWarGoalOccupation } from "./army-actions";
+import { declareRebellion, isInvolvedInWar, tickAllegianceDemands, tickClaimFabrications } from "./actions";
 import {
   ALLIED_BLOC_REBEL_CHANCE,
   listAlliedBlocThreats,
@@ -40,6 +41,7 @@ function cloneWars(wars: GameState["wars"]): GameState["wars"] {
     capturedByDefender: [...(w.capturedByDefender || [])],
     allyOfAttacker: w.allyOfAttacker ? [...w.allyOfAttacker] : undefined,
     allyOfDefender: w.allyOfDefender ? [...w.allyOfDefender] : undefined,
+    declinedAllyCalls: w.declinedAllyCalls ? [...w.declinedAllyCalls] : undefined,
   }));
 }
 
@@ -49,12 +51,42 @@ function cloneAllyCallRequests(
   return requests.map((r) => ({ ...r }));
 }
 
+function cloneAllegianceDemands(
+  requests: GameState["allegianceDemands"],
+): GameState["allegianceDemands"] {
+  return requests.map((r) => ({ ...r }));
+}
+
 function cloneArmies(armies: GameState["armies"]): GameState["armies"] {
   return armies.map((a) => ({
     ...a,
     path: a.path ? [...a.path] : undefined,
     battleOpponentIds: a.battleOpponentIds ? [...a.battleOpponentIds] : undefined,
   }));
+}
+
+/**
+ * Clone superficiel de `world`, sans toucher aux géométries figées (littoral,
+ * rivières, `boundary` des domaines/provinces/royaumes/possessions…) — seuls
+ * les tableaux réellement mutés en place pendant un tick (vassaux, domaines
+ * tenus, revendications) sont recopiés. Un `structuredClone(world)` complet
+ * recopiait ~126k points de coordonnées à chaque jour écoulé (~30-40 ms),
+ * perceptible en jeu à vitesse rapide.
+ */
+function cloneWorldMutable(world: GameState["world"]): GameState["world"] {
+  return {
+    ...world,
+    domaines: world.domaines.map((d) => ({ ...d })),
+    provinces: (world.provinces || []).map((p) => ({ ...p, domaines: [...p.domaines] })),
+    royaumes: (world.royaumes || []).map((r) => ({ ...r, domaines: [...r.domaines] })),
+    possessions: (world.possessions || []).map((p) => ({
+      ...p,
+      vassalIds: [...(p.vassalIds || [])],
+      domaines: [...p.domaines],
+      claims: p.claims ? p.claims.map((c) => ({ ...c })) : p.claims,
+      domainClaims: p.domainClaims ? [...p.domainClaims] : p.domainClaims,
+    })),
+  };
 }
 
 /** Durée d’un jour calendaire en ms selon la vitesse. */
@@ -109,7 +141,7 @@ function advanceCalendar(game: GameState): { monthRolled: boolean } {
 
 function ensureWorldClone(game: GameState, original: GameState): void {
   if (game.world === original.world) {
-    game.world = structuredClone(original.world);
+    game.world = cloneWorldMutable(original.world);
   }
 }
 
@@ -268,7 +300,7 @@ function tickAlliedVassalThreat(game: GameState): void {
 function applyProvinceOverageDiscontent(game: GameState): void {
   for (const p of game.world.possessions || []) {
     if (!p.vassalIds?.length) continue;
-    const overage = provinceOverage(game.world, p);
+    const overage = provinceOverage(game.titles || [], p);
     if (overage <= 0) continue;
     for (const vassalId of p.vassalIds) {
       adjustOpinion(
@@ -317,11 +349,15 @@ export function tickFrame(game: GameState, dtMs: number): GameState {
     allyCallRequests: (game.allyCallRequests || []).length
       ? cloneAllyCallRequests(game.allyCallRequests)
       : game.allyCallRequests,
+    allegianceDemands: (game.allegianceDemands || []).length
+      ? cloneAllegianceDemands(game.allegianceDemands)
+      : game.allegianceDemands,
     claimFabrications: (game.claimFabrications || []).map((f) => ({ ...f })),
     titles: game.titles,
     kingdomDrifts: game.kingdomDrifts,
     opinions: game.opinions,
     giftsSent: game.giftsSent,
+    warTruces: game.warTruces,
     alliances: game.alliances,
     log: game.log,
     notices: game.notices,
@@ -351,6 +387,8 @@ export function tickFrame(game: GameState, dtMs: number): GameState {
       tickArmies(next);
       runAiWarConduct(next);
       tickAllyCallRequests(next);
+      tickAllegianceDemands(next);
+      tickWarGoalOccupation(next);
       tickClaimFabrications(next);
       tickKingdomDrifts(next);
 

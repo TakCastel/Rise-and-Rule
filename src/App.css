@@ -696,8 +696,36 @@
   background: #0b1220;
 }
 
+/*
+ * Canvas (couche statique peinte) + SVG (marqueurs d'armée, libellés, et
+ * formes invisibles pour les clics/survols) empilés au même endroit — tous
+ * deux `position:absolute` pour que l'ordre du DOM (canvas d'abord) décide
+ * du z-index, indépendamment de tout `position:static` par défaut qui
+ * ferait sinon passer un élément positionné au-dessus quel que soit son
+ * ordre dans le document.
+ */
+.map2d-canvas {
+  position: absolute;
+  inset: 0;
+  /*
+   * `inset:0` seul ne garantit pas la taille d'affichage : ce canvas a des
+   * attributs `width`/`height` (posés en JS, mis à l'échelle du
+   * devicePixelRatio pour la netteté) qui définissent sa taille intrinsèque
+   * — sans `width`/`height` CSS explicites ici, certains navigateurs
+   * retombent sur cette taille intrinsèque au lieu d'étirer l'élément pour
+   * remplir `.map2d`, décalant tout le contenu peint vers le bas-droite
+   * (ancré en haut-gauche, mais deux fois trop grand sur un écran Retina).
+   */
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
 .map2d-svg {
-  background: #0b1220;
+  position: absolute;
+  inset: 0;
+  background: transparent;
 }
 
 .map2d:active {
@@ -914,6 +942,14 @@
 .war-panel-title {
   font-size: 0.85rem;
   font-weight: 600;
+}
+
+.war-panel-cause {
+  font-size: 0.68rem;
+  font-weight: 500;
+  font-style: italic;
+  color: hsl(var(--muted-foreground));
+  margin-top: -0.1rem;
 }
 
 .war-panel-status {
@@ -1453,15 +1489,48 @@
   font-variant-numeric: tabular-nums;
 }
 
-.selection-list-block {
-  display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
+/**
+ * Section repliable (`CollapsibleSection`) — remplace l'ancien
+ * `.selection-list-block` toujours-déployé : header cliquable (titre +
+ * compteur + chevron), corps masqué tant que replié. Auto-suffisant (ne
+ * dépend d'aucune classe parente) pour marcher identiquement dans l'aside
+ * (`GameMenu`) et la fiche de territoire (`SelectionCard`).
+ */
+.collapsible-section {
   border-top: 1px solid hsl(var(--border));
-  padding-top: 0.65rem;
+  padding-top: 0.6rem;
+  margin-top: 0.6rem;
 }
 
-.selection-list-block h3 {
+.collapsible-section:first-child {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+.collapsible-section-header {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  margin: 0;
+  padding: 0.15rem 0.2rem;
+  margin-left: -0.2rem;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  border-radius: calc(var(--radius) - 2px);
+  transition: background 0.12s ease;
+}
+
+.collapsible-section-header:hover {
+  background: hsl(var(--accent) / 0.6);
+}
+
+.collapsible-section-title {
+  flex: 1;
   margin: 0;
   font-size: 0.68rem;
   letter-spacing: 0.06em;
@@ -1470,7 +1539,28 @@
   font-weight: 500;
 }
 
-.selection-list-block ul {
+.collapsible-section-count {
+  color: hsl(var(--muted-foreground));
+  font-size: 0.7rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.collapsible-section-chevron {
+  flex-shrink: 0;
+  color: hsl(var(--muted-foreground));
+  transition: transform 0.15s ease;
+}
+
+.collapsible-section-chevron.is-open {
+  transform: rotate(180deg);
+}
+
+.collapsible-section-body {
+  margin-top: 0.45rem;
+}
+
+.collapsible-section-body ul {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -1478,8 +1568,32 @@
   overflow-y: auto;
 }
 
-.selection-list-block li + li {
+.collapsible-section-body li + li {
   border-top: 1px solid hsl(var(--border) / 0.7);
+}
+
+.collapsible-section-body button {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  margin: 0;
+  padding: 0.38rem 0.15rem;
+  border: none;
+  background: transparent;
+  color: hsl(var(--foreground));
+  font-size: 0.8rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  border-radius: calc(var(--radius) - 2px);
+  transition: background 0.12s ease;
+}
+
+.collapsible-section-body button:hover {
+  background: hsl(var(--accent));
 }
 
 .selection-domain-grant {
@@ -1559,30 +1673,6 @@
   cursor: not-allowed;
 }
 
-.selection-list-block button {
-  appearance: none;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  width: 100%;
-  margin: 0;
-  padding: 0.38rem 0.15rem;
-  border: none;
-  background: transparent;
-  color: hsl(var(--foreground));
-  font-size: 0.8rem;
-  font-weight: 500;
-  text-align: left;
-  cursor: pointer;
-  border-radius: calc(var(--radius) - 2px);
-  transition: background 0.12s ease;
-}
-
-.selection-list-block button:hover {
-  background: hsl(var(--accent));
-}
-
 .selection-list-aside {
   color: hsl(var(--muted-foreground));
   font-size: 0.7rem;
@@ -1633,6 +1723,10 @@
 }
 
 /* Round Lucide filter icons */
+.level-selector-wrap {
+  position: relative;
+}
+
 .level-selector {
   display: inline-flex;
   flex-wrap: wrap;
@@ -1647,6 +1741,53 @@
     0 1px 2px hsl(0 0% 0% / 0.35),
     0 8px 24px hsl(0 0% 0% / 0.25);
   backdrop-filter: blur(10px);
+}
+
+.level-more-popover {
+  position: absolute;
+  bottom: calc(100% + 0.5rem);
+  right: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 9.5rem;
+  padding: 0.35rem;
+  background: hsl(var(--popover) / 0.98);
+  border: 1px solid hsl(var(--border));
+  border-radius: calc(var(--radius) + 4px);
+  box-shadow:
+    0 1px 2px hsl(0 0% 0% / 0.3),
+    0 16px 40px hsl(0 0% 0% / 0.45);
+  backdrop-filter: blur(14px);
+  animation: notice-modal-in 0.15s ease;
+}
+
+.level-more-item {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.55rem;
+  border: none;
+  border-radius: calc(var(--radius) - 2px);
+  background: transparent;
+  color: hsl(var(--popover-foreground));
+  font-size: 0.76rem;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.level-more-item:hover {
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
+}
+
+.level-more-item.active {
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
 }
 
 .level-icon-btn {
@@ -1936,6 +2077,57 @@
   color: hsl(var(--muted-foreground));
 }
 
+.game-menu-focus {
+  margin: 1rem 0 0;
+  padding-top: 0.85rem;
+  border-top: 1px solid hsl(var(--border));
+}
+
+.game-menu-focus-title {
+  margin: 0 0 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: hsl(var(--muted-foreground));
+}
+
+.game-menu-focus-buttons {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.game-menu-focus-btn {
+  flex: 1;
+  appearance: none;
+  cursor: pointer;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-size: 0.78rem;
+  font-weight: 600;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.game-menu-focus-btn:hover {
+  background: hsl(var(--accent));
+  border-color: hsl(var(--accent));
+}
+
+.game-menu-focus-btn.active {
+  background: hsl(var(--primary));
+  border-color: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+}
+
+.game-menu-focus-hint {
+  margin: 0.4rem 0 0;
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
 .game-menu-titles-list {
   list-style: none;
   margin: 0.35rem 0 0;
@@ -1970,6 +2162,19 @@
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: hsl(var(--muted-foreground));
+}
+
+.game-menu-capital-tag {
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: hsl(var(--primary) / 0.18);
+  color: hsl(var(--primary));
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
 }
 
 .game-menu h3 {
@@ -2449,4 +2654,109 @@
 
 .notice-modal-btn:hover {
   background: hsl(0 0% 100%);
+}
+
+.notice-toast-stack {
+  position: absolute;
+  top: 4.75rem;
+  right: 1rem;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: min(320px, calc(100% - 2rem));
+  pointer-events: none;
+}
+
+.notice-toast {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.75rem 0.85rem;
+  background: hsl(var(--popover) / 0.98);
+  color: hsl(var(--popover-foreground));
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  box-shadow:
+    0 1px 2px hsl(0 0% 0% / 0.25),
+    0 12px 32px hsl(0 0% 0% / 0.4);
+  backdrop-filter: blur(14px);
+  pointer-events: auto;
+  animation: notice-toast-in 0.18s ease;
+  overflow: hidden;
+}
+
+.notice-toast-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: hsl(var(--border));
+}
+
+.notice-toast-progress-bar {
+  height: 100%;
+  width: 100%;
+  background: hsl(var(--foreground) / 0.55);
+  transform-origin: left;
+  animation-name: notice-toast-countdown;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+@keyframes notice-toast-countdown {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+@keyframes notice-toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.notice-toast-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.notice-toast-message {
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: hsl(var(--muted-foreground));
+}
+
+.notice-toast-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+.notice-toast-btn {
+  appearance: none;
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  background: transparent;
+  color: hsl(var(--foreground));
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.notice-toast-btn:hover {
+  background: hsl(var(--muted));
 }

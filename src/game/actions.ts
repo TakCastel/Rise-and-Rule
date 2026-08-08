@@ -70,6 +70,7 @@ import {
   controlsDomain,
   vassalDepth,
   MAX_VASSAL_DEPTH,
+  findProvinceTitle,
 } from "./titles";
 import {
   activeWarBetween,
@@ -78,13 +79,15 @@ import {
   buildConquestOrder,
   canAttackByRank,
   findPossession,
+  isTruceActive,
   isUnderLiege,
   rebuildPossessionNeighbors,
   resolveWarDefender,
   seaLinkedDomainNeighbors,
   transferDomains,
+  truceUntilYear,
 } from "./war";
-import type { Possession, Royaume } from "../types/world";
+import type { Possession, PossessionFocus, Royaume } from "../types/world";
 
 export type ActionKind =
   | "war"
@@ -125,6 +128,8 @@ export interface ActionPreview {
   claimRoyaumeId?: number;
   claimTitleName?: string;
   warGoalDomainIds?: number[];
+  /** Motif de guerre à utiliser si différent du défaut (claim_province) — ex. "vassalize". */
+  casusBelli?: CasusBelli;
   /** Détail pour l’UI allégeance / alliance. */
   gates?: {
     opinionOk: boolean;
@@ -148,8 +153,8 @@ export function previewAction(
   if (!player || !target || player.id === target.id) return null;
 
   const neighbor = areNeighbors(game.world, player.id, target.id);
-  const playerPower = possessionPower(game.world, player, game.opinions);
-  const targetPower = possessionPower(game.world, target, game.opinions);
+  const playerPower = possessionPower(game.world, player, game.opinions, game.armies);
+  const targetPower = possessionPower(game.world, target, game.opinions, game.armies);
   const ratio = powerRatio(playerPower, targetPower);
   const opinion = getOpinion(game.opinions, target.id, player.id);
 
@@ -445,6 +450,19 @@ export function previewAction(
       opinion,
     };
   }
+  if (isTruceActive(game, player.id, target.id)) {
+    return {
+      kind,
+      ok: false,
+      reason: `Truce in effect until ${truceUntilYear(game, player.id, target.id)}`,
+      ratio,
+      chance: 0,
+      playerPower,
+      targetPower,
+      neighbor,
+      opinion,
+    };
+  }
   if (activeWarBetween(game, player.id, target.id)) {
     return {
       kind,
@@ -506,10 +524,10 @@ export function previewAction(
       kind,
       ok: false,
       reason: `${defender.holderName} protects them and is your ally`,
-      ratio: powerRatio(playerPower, possessionPower(game.world, defender, game.opinions)),
+      ratio: powerRatio(playerPower, possessionPower(game.world, defender, game.opinions, game.armies)),
       chance: 0,
       playerPower,
-      targetPower: possessionPower(game.world, defender, game.opinions),
+      targetPower: possessionPower(game.world, defender, game.opinions, game.armies),
       neighbor,
       opinion: getOpinion(game.opinions, defender.id, player.id),
       redirectedToId: defender.id,
@@ -540,11 +558,11 @@ export function previewAction(
       }`,
       ratio: powerRatio(
         playerPower,
-        possessionPower(game.world, defender, game.opinions),
+        possessionPower(game.world, defender, game.opinions, game.armies),
       ),
       chance: 0,
       playerPower,
-      targetPower: possessionPower(game.world, defender, game.opinions),
+      targetPower: possessionPower(game.world, defender, game.opinions, game.armies),
       neighbor,
       opinion: getOpinion(game.opinions, defender.id, player.id),
       redirectedToId: defender.id !== target.id ? defender.id : undefined,
@@ -568,7 +586,7 @@ export function previewAction(
       ratio,
       chance: 0,
       playerPower,
-      targetPower: possessionPower(game.world, defender, game.opinions),
+      targetPower: possessionPower(game.world, defender, game.opinions, game.armies),
       neighbor,
       opinion: getOpinion(game.opinions, defender.id, player.id),
       redirectedToId: defender.id !== target.id ? defender.id : undefined,
@@ -586,11 +604,11 @@ export function previewAction(
       reason: "Not a neighbor",
       ratio: powerRatio(
         playerPower,
-        possessionPower(game.world, defender, game.opinions),
+        possessionPower(game.world, defender, game.opinions, game.armies),
       ),
       chance: 0,
       playerPower,
-      targetPower: possessionPower(game.world, defender, game.opinions),
+      targetPower: possessionPower(game.world, defender, game.opinions, game.armies),
       neighbor: false,
       opinion: getOpinion(game.opinions, defender.id, player.id),
       claimTitleId: warGoal.claimTitleId,
@@ -604,7 +622,7 @@ export function previewAction(
     };
   }
 
-  const defPower = possessionPower(game.world, defender, game.opinions);
+  const defPower = possessionPower(game.world, defender, game.opinions, game.armies);
   return {
     kind,
     ok: true,
@@ -625,7 +643,57 @@ export function previewAction(
   };
 }
 
-/** Demande d’allégeance — refus si opinion / voisinage / force insuffisants. */
+/** Une demande adressée au joueur expire (refus automatique) après ce délai. */
+const ALLEGIANCE_DEMAND_TIMEOUT_DAYS = 10;
+
+/** Chance de refus maximale, tout juste au-dessus du seuil de force minimal. */
+const ALLEGIANCE_REFUSAL_MAX_CHANCE = 0.15;
+/** Vitesse à laquelle cette chance retombe à 0 à mesure que l’écart de force grandit. */
+const ALLEGIANCE_REFUSAL_DECAY = 0.15;
+
+/**
+ * Chance minime qu’une cible IA, se sentant assez forte, défie la demande
+ * malgré des jauges autrement favorables — quasi nulle loin au-dessus du
+ * seuil, sensible tout juste au-dessus.
+ */
+function evaluateAllegianceRefusal(ratio: number): boolean {
+  const margin = Math.max(0, ratio - ALLEGIANCE_POWER_RATIO);
+  const chance = Math.max(0, ALLEGIANCE_REFUSAL_MAX_CHANCE - margin * ALLEGIANCE_REFUSAL_DECAY);
+  return Math.random() < chance;
+}
+
+/**
+ * Guerre de vassalisation déclenchée par un refus de soumission — le
+ * demandeur (déjà éligible, prestige déjà dépensé pour la demande) force la
+ * question par les armes plutôt que de rester sans réponse.
+ */
+function forceVassalizeWar(game: GameState, demander: Possession, refuser: Possession): void {
+  if (isInvolvedInWar(game, demander.id) || activeWarBetween(game, demander.id, refuser.id)) return;
+  startCampaign(
+    game,
+    demander,
+    refuser,
+    "vassalize",
+    `${demander.holderName} marches to force ${refuser.holderName}'s submission`,
+  );
+  if (refuser.id === game.playerId) {
+    pushNotice(game, `${demander.holderName} declares war to force your submission!`, {
+      title: "War declared upon you",
+    });
+  }
+}
+
+/**
+ * Demande d’allégeance — refus si opinion / voisinage / force / prestige
+ * insuffisants (aucun coût dans ce cas : la demande n’a jamais lieu). Passé
+ * ces jauges, le prestige est dépensé immédiatement — c’est lui qui permet
+ * de formuler la demande, quelle qu’en soit l’issue :
+ * - cible = joueur : une popup bloquante exige une réponse manuelle ;
+ * - cible IA : résolue le jour même, avec une chance minime de défi si
+ *   elle se sent assez forte pour refuser malgré tout.
+ * Un refus (des deux côtés) déclenche une guerre de vassalisation du
+ * demandeur contre le refusant.
+ */
 export function demandAllegiance(
   game: GameState,
   targetId: number,
@@ -651,6 +719,34 @@ export function demandAllegiance(
   const cost = preview.prestigeCost ?? allegiancePrestigeCost(target.rank);
   addPrestige(player, -cost);
 
+  if (targetId === game.playerId) {
+    if (!game.allegianceDemands) game.allegianceDemands = [];
+    if (game.nextAllegianceDemandId == null) game.nextAllegianceDemandId = 1;
+    game.allegianceDemands.push({
+      id: game.nextAllegianceDemandId++,
+      demanderId: player.id,
+      targetId: target.id,
+      daysElapsed: 0,
+    });
+    pushLog(
+      game,
+      `${player.holderName} demands your submission as their vassal (−${formatPrestige(cost)} prestige spent to press the claim).`,
+      [player.id, target.id],
+    );
+    return true;
+  }
+
+  if (evaluateAllegianceRefusal(preview.ratio)) {
+    pushLog(
+      game,
+      `${target.holderName} defies ${player.holderName}'s demand for submission!`,
+      [player.id, target.id],
+    );
+    adjustOpinion(game.opinions, target.id, player.id, -20);
+    forceVassalizeWar(game, player, target);
+    return true;
+  }
+
   attachAsVassal(game.world, target, player);
 
   adjustOpinion(game.opinions, target.id, player.id, 28);
@@ -663,6 +759,67 @@ export function demandAllegiance(
     [player.id, target.id],
   );
   return true;
+}
+
+/** Réponse manuelle du joueur à une demande d’allégeance reçue (popup). */
+export function respondAllegianceDemand(
+  game: GameState,
+  requestId: number,
+  accept: boolean,
+  actorId: number = game.playerId ?? -1,
+): boolean {
+  const idx = (game.allegianceDemands || []).findIndex(
+    (r) => r.id === requestId && r.targetId === actorId,
+  );
+  if (idx < 0) return false;
+  const request = game.allegianceDemands[idx];
+  game.allegianceDemands = game.allegianceDemands.filter((r) => r.id !== requestId);
+
+  const demander = findPossession(game.world, request.demanderId);
+  const target = findPossession(game.world, actorId);
+  if (!demander || !target) return false;
+
+  if (accept) {
+    attachAsVassal(game.world, target, demander);
+    adjustOpinion(game.opinions, target.id, demander.id, 28);
+    adjustOpinion(game.opinions, demander.id, target.id, 16);
+    rebuildPossessionNeighbors(game.world);
+    pushLog(game, `You submit to ${demander.holderName} as their vassal.`, [demander.id, target.id]);
+  } else {
+    adjustOpinion(game.opinions, target.id, demander.id, -20);
+    pushLog(
+      game,
+      `You defy ${demander.holderName}'s demand for your submission!`,
+      [demander.id, target.id],
+    );
+    forceVassalizeWar(game, demander, target);
+  }
+  return true;
+}
+
+/** Fait vieillir les demandes d’allégeance en attente ; trop anciennes = refus automatique. */
+export function tickAllegianceDemands(game: GameState): void {
+  if (!game.allegianceDemands?.length) return;
+  const kept: typeof game.allegianceDemands = [];
+  for (const request of game.allegianceDemands) {
+    request.daysElapsed += 1;
+    if (request.daysElapsed < ALLEGIANCE_DEMAND_TIMEOUT_DAYS) {
+      kept.push(request);
+      continue;
+    }
+    const demander = findPossession(game.world, request.demanderId);
+    const target = findPossession(game.world, request.targetId);
+    if (demander && target) {
+      pushLog(
+        game,
+        `${target.holderName} never answers ${demander.holderName}'s demand for submission — the moment passes.`,
+        [request.demanderId, request.targetId],
+      );
+      adjustOpinion(game.opinions, target.id, demander.id, -20);
+      forceVassalizeWar(game, demander, target);
+    }
+  }
+  game.allegianceDemands = kept;
 }
 
 /**
@@ -703,6 +860,15 @@ export function requestAlliance(
     `${player.holderName} seals a marriage alliance with ${target.holderName}. They will join each other's wars.`,
     [player.id, target.id],
   );
+  // L'IA propose et scelle l'union en un seul geste (pas d'étape d'acceptation
+  // côté joueur) — sans notice explicite, une nouvelle alliance passerait
+  // inaperçue au milieu de la chronique.
+  if (targetId === game.playerId && actorId !== game.playerId) {
+    pushNotice(game, `${player.holderName} is now your ally by marriage.`, {
+      title: "New alliance",
+      blocking: false,
+    });
+  }
   return true;
 }
 
@@ -797,11 +963,13 @@ export function declareWar(
   const defender = resolveWarDefender(game.world, player, target);
 
   const label =
-    defender.id !== target.id
-      ? `${player.holderName} declares war on ${defender.holderName} (defending ${target.holderName})`
-      : `${player.holderName} declares war on ${target.holderName}`;
+    preview.casusBelli === "vassalize"
+      ? `${player.holderName} marches to force ${defender.holderName}'s submission`
+      : defender.id !== target.id
+        ? `${player.holderName} declares war on ${defender.holderName} (defending ${target.holderName})`
+        : `${player.holderName} declares war on ${target.holderName}`;
 
-  startCampaign(game, player, defender, "claim_province", label, {
+  startCampaign(game, player, defender, preview.casusBelli ?? "claim_province", label, {
     titleId: preview.claimTitleId,
     provinceId: preview.claimProvinceId,
     royaumeId: preview.claimRoyaumeId,
@@ -937,6 +1105,29 @@ export function claimKingdomTitle(
       ? `${actor.holderName} usurps ${title.name} (−${formatGold(goldCost)} gold, +${formatPrestige(prestigeGain)} prestige).`
       : `${actor.holderName} claims ${title.name} (−${formatGold(goldCost)} gold, +${formatPrestige(prestigeGain)} prestige).`,
     prevHolderId != null ? [actor.id, prevHolderId] : [actor.id],
+  );
+  return true;
+}
+
+/**
+ * Politique du royaume : bascule (ou annule si déjà actif) le focus choisi —
+ * bonus au gain concerné, malus aux deux autres (voir `focus.ts`).
+ */
+export function setPossessionFocus(
+  game: GameState,
+  focus: PossessionFocus,
+  actorId: number = game.playerId ?? -1,
+): boolean {
+  const actor = findPossession(game.world, actorId);
+  if (!actor) return false;
+  const next = actor.focus === focus ? undefined : focus;
+  actor.focus = next;
+  pushLog(
+    game,
+    next
+      ? `${actor.holderName} shifts the realm's focus to ${next}.`
+      : `${actor.holderName} returns to a balanced policy.`,
+    [actor.id],
   );
   return true;
 }
@@ -1391,6 +1582,17 @@ export interface AvailableDomainGrant {
   development: number;
 }
 
+export interface AvailableProvinceTitleCession {
+  /** Id de la province (de jure). */
+  id: number;
+  name: string;
+  /** Domaines de la province actuellement tenus en propre (peut être 0 — le titre reste dû même sans terre dedans). */
+  domainsHeld: number;
+  /** Vassal auquel le titre serait cédé. */
+  vassalId: number;
+  vassalName: string;
+}
+
 export interface AvailableRebellion {
   liegeId: number;
   liegeName: string;
@@ -1421,8 +1623,8 @@ export interface AvailableActions {
   excessDomains: AvailableDomainGrant[];
   overage: number;
   penaltyPercent: number;
-  /** Domaines à déléguer si plus de PROVINCE_DEMESNE_LIMIT provinces en demesne. */
-  excessProvinceDomains: AvailableDomainGrant[];
+  /** Titres de province à céder si plus de PROVINCE_DEMESNE_LIMIT provinces détenues. */
+  excessProvinceTitles: AvailableProvinceTitleCession[];
   provinceOverage: number;
   /** Rébellion possible contre le seigneur. */
   rebellion: AvailableRebellion | null;
@@ -1441,7 +1643,7 @@ export function listAvailableActions(game: GameState): AvailableActions {
   const domainFabrications: AvailableDomainFabrication[] = [];
   const fabricationProgress: AvailableFabricationProgress[] = [];
   const excessDomains: AvailableDomainGrant[] = [];
-  const excessProvinceDomains: AvailableDomainGrant[] = [];
+  const excessProvinceTitles: AvailableProvinceTitleCession[] = [];
   let rebellion: AvailableRebellion | null = null;
   const empty = {
     wars,
@@ -1455,7 +1657,7 @@ export function listAvailableActions(game: GameState): AvailableActions {
     excessDomains,
     overage: 0,
     penaltyPercent: 0,
-    excessProvinceDomains,
+    excessProvinceTitles,
     provinceOverage: 0,
     rebellion,
     childrenTokens: 0,
@@ -1497,9 +1699,11 @@ export function listAvailableActions(game: GameState): AvailableActions {
             : target;
         // Puissance réelle : leur camp complet (demesne + vassaux + alliés), pas juste leur host.
         const enemyTotalPower =
-          war.targetPower + allyTroopContribution(game.world, named, game.opinions, game.alliances);
+          war.targetPower +
+          allyTroopContribution(game.world, named, game.opinions, game.alliances, game.armies);
         const myTotalPower =
-          war.playerPower + allyTroopContribution(game.world, player, game.opinions, game.alliances);
+          war.playerPower +
+          allyTroopContribution(game.world, player, game.opinions, game.alliances, game.armies);
         wars.push({
           id: named.id,
           holderName: named.holderName,
@@ -1725,35 +1929,48 @@ export function listAvailableActions(game: GameState): AvailableActions {
     excessDomains.sort((a, b) => a.income - b.income);
   }
 
-  const provinceOverageCount = provinceOverage(game.world, player);
+  const provinceOverageCount = provinceOverage(game.titles || [], player);
   if (provinceOverageCount > 0) {
-    // Regroupe le demesne par province, garde les provinces où le joueur a
-    // le plus de présence comme « cœur », propose de déléguer le reste.
-    const byProvince = new Map<number, number[]>();
+    // Classe les titres de province détenus par domaines personnellement
+    // tenus dedans (0 si le titre est acquis sans plus aucune terre en
+    // propre) — garde les plus « investis » comme cœur, propose de céder
+    // les autres à un vassal (de préférence un déjà présent dans la province).
+    const domainCountByProvince = new Map<number, number>();
     for (const id of player.domaines || []) {
       const d = game.world.domaines.find((x) => x.id === id) ?? game.world.domaines[id];
       if (!d || d.provinceId == null) continue;
-      const list = byProvince.get(d.provinceId) ?? [];
-      list.push(id);
-      byProvince.set(d.provinceId, list);
+      domainCountByProvince.set(d.provinceId, (domainCountByProvince.get(d.provinceId) ?? 0) + 1);
     }
-    const ranked = [...byProvince.entries()].sort((a, b) => b[1].length - a[1].length);
-    const toDelegate = ranked.slice(PROVINCE_DEMESNE_LIMIT);
-    for (const [, domainIds] of toDelegate) {
-      for (const id of domainIds) {
-        const preview = previewGrantDomain(game, id, null, player.id);
-        if (!preview?.ok) continue;
-        const d = game.world.domaines.find((x) => x.id === id) ?? game.world.domaines[id];
-        if (!d) continue;
-        excessProvinceDomains.push({
-          id: d.id,
-          name: d.name,
-          income: domainMonthlyIncome(d),
-          development: d.development ?? 0,
-        });
-      }
+    const heldTitles = (game.titles || []).filter(
+      (t) => t.tier === "province" && t.holderId === player.id,
+    );
+    const ranked = heldTitles
+      .map((t) => ({ title: t, domainsHeld: domainCountByProvince.get(t.deJureId) ?? 0 }))
+      .sort((a, b) => b.domainsHeld - a.domainsHeld);
+    const toCede = ranked.slice(PROVINCE_DEMESNE_LIMIT);
+    for (const { title, domainsHeld } of toCede) {
+      const province = (game.world.provinces || []).find((p) => p.id === title.deJureId);
+      if (!province) continue;
+      const candidateId =
+        (player.vassalIds || []).find((vid) => {
+          const v = findPossession(game.world, vid);
+          return v?.domaines?.some((did) => {
+            const d = game.world.domaines.find((x) => x.id === did) ?? game.world.domaines[did];
+            return d?.provinceId === province.id;
+          });
+        }) ?? (player.vassalIds || [])[0];
+      if (candidateId == null) continue;
+      const preview = previewCedeProvinceTitle(game, province.id, candidateId, player.id);
+      if (!preview?.ok || !preview.vassalName) continue;
+      excessProvinceTitles.push({
+        id: province.id,
+        name: province.name,
+        domainsHeld,
+        vassalId: candidateId,
+        vassalName: preview.vassalName,
+      });
     }
-    excessProvinceDomains.sort((a, b) => a.income - b.income);
+    excessProvinceTitles.sort((a, b) => a.domainsHeld - b.domainsHeld);
   }
 
   // Guerres : plus faibles d’abord · Allégeance / alliés : plus forts d’abord
@@ -1772,7 +1989,7 @@ export function listAvailableActions(game: GameState): AvailableActions {
     excessDomains,
     overage,
     penaltyPercent,
-    excessProvinceDomains,
+    excessProvinceTitles,
     provinceOverage: provinceOverageCount,
     rebellion,
     childrenTokens,
@@ -2051,6 +2268,81 @@ export function grantDomain(
   }
 
   rebuildPossessionNeighbors(game.world);
+  return true;
+}
+
+export interface CedeProvinceTitlePreview {
+  ok: boolean;
+  reason?: string;
+  provinceId: number;
+  provinceName: string;
+  vassalId: number | null;
+  vassalName: string | null;
+}
+
+/**
+ * Céder un titre de province : contrairement à un domaine, un titre n'a pas
+ * de terre à transmettre avec lui — il ne peut donc aller qu'à un vassal déjà
+ * existant (rien pour fonder un nouveau seigneur sans domaine en dot).
+ */
+export function previewCedeProvinceTitle(
+  game: GameState,
+  provinceId: number,
+  vassalId: number | null = null,
+  actorId: number = game.playerId ?? -1,
+): CedeProvinceTitlePreview | null {
+  const actor = findPossession(game.world, actorId);
+  if (!actor) return null;
+  const province = (game.world.provinces || []).find((p) => p.id === provinceId);
+  if (!province) return null;
+
+  const base: CedeProvinceTitlePreview = {
+    ok: false,
+    provinceId,
+    provinceName: province.name,
+    vassalId,
+    vassalName: null,
+  };
+
+  const title = findProvinceTitle(game.titles || [], provinceId);
+  if (!title || title.holderId !== actor.id) {
+    return { ...base, reason: "You do not hold this province title" };
+  }
+  if (vassalId == null) {
+    return { ...base, reason: "Choose a vassal to receive the title" };
+  }
+  const vassal = findPossession(game.world, vassalId);
+  if (!vassal || vassal.liegeId !== actor.id) {
+    return { ...base, reason: "Not your vassal" };
+  }
+  return { ...base, ok: true, vassalName: vassal.holderName };
+}
+
+export function cedeProvinceTitle(
+  game: GameState,
+  provinceId: number,
+  vassalId: number,
+  actorId: number = game.playerId ?? -1,
+): boolean {
+  const preview = previewCedeProvinceTitle(game, provinceId, vassalId, actorId);
+  if (!preview?.ok) {
+    if (actorId === game.playerId && preview?.reason) {
+      pushLog(game, `Cannot cede ${preview.provinceName}: ${preview.reason}.`);
+    }
+    return false;
+  }
+  const actor = findPossession(game.world, actorId);
+  const vassal = findPossession(game.world, vassalId);
+  const title = findProvinceTitle(game.titles || [], provinceId);
+  if (!actor || !vassal || !title) return false;
+
+  title.holderId = vassal.id;
+  adjustOpinion(game.opinions, vassal.id, actor.id, 15);
+  pushLog(
+    game,
+    `${actor.holderName} cedes the title of ${preview.provinceName} to vassal ${vassal.holderName}.`,
+    [actor.id, vassal.id],
+  );
   return true;
 }
 

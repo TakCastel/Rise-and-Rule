@@ -51,6 +51,7 @@ export function ArmyPanel({
             {army.stance === "idle" && "Idle — right-click a domain to march"}
             {army.stance === "moving" && "Marching — right-click a domain to redirect"}
             {army.stance === "battling" && "In battle"}
+            {army.stance === "routing" && "Routed — fleeing, cannot be ordered until it regroups"}
           </div>
         )}
       </div>

@@ -19,12 +19,15 @@ export interface GameLogEntry {
  * - claim_province : récupérer domaines / titre de province (borné)
  * - depose / independence : rébellion
  * - conquest : legacy (traité comme claim si possible)
+ * - vassalize : soumettre un seigneur indépendant par la force (échec d'une
+ *   allégeance demandée à l'amiable, ou initiative directe)
  */
 export type CasusBelli =
   | "claim_province"
   | "conquest"
   | "depose"
-  | "independence";
+  | "independence"
+  | "vassalize";
 
 /**
  * Guerre en cours — conduite manuellement via des armées (`Army`, voir
@@ -50,6 +53,8 @@ export interface WarState {
   allyOfAttacker?: number[];
   /** Alliés ayant répondu à l’appel côté défenseur. */
   allyOfDefender?: number[];
+  /** Alliés ayant déjà refusé un appel à l’aide dans cette guerre — plus resollicités. */
+  declinedAllyCalls?: number[];
   /** Défaut : claim_province. */
   casusBelli?: CasusBelli;
   /** Titre contesté (guerres de province). */
@@ -63,6 +68,8 @@ export interface WarState {
   /** Batailles rangées remportées depuis la déclaration (hors sièges) — contribue à la progression de guerre. */
   battleWinsAttacker?: number;
   battleWinsDefender?: number;
+  /** Jours consécutifs où l'attaquant tient l'intégralité du war goal — remis à 0 dès qu'un domaine du goal repasse aux mains adverses. */
+  warGoalOccupiedDays?: number;
 }
 
 /** Alliance bilatérale (mariage / pacte). */
@@ -117,6 +124,20 @@ export interface AllyCallRequest {
   daysElapsed: number;
 }
 
+/**
+ * Demande d’allégeance en attente : `demanderId` exige la soumission de
+ * `targetId` comme vassal. Si `targetId` est le joueur, une popup bloquante
+ * exige une réponse manuelle (accepter/refuser) ; un refus déclenche une
+ * guerre de vassalisation du demandeur contre lui. Sinon, résolue le jour
+ * même (IA cible : chance minime de refus si elle se sent assez forte).
+ */
+export interface AllegianceDemand {
+  id: number;
+  demanderId: number;
+  targetId: number;
+  daysElapsed: number;
+}
+
 /** Bouton d’une notice modale — `id` est renvoyé à `onDismiss` pour distinguer le choix fait. */
 export interface NoticeAction {
   id: string;
@@ -124,16 +145,21 @@ export interface NoticeAction {
 }
 
 /**
- * Notice bloquante générique : modale mettant le jeu en pause tant qu’elle
- * n’a pas été acquittée. Réutilisable pour n’importe quel évènement méritant
- * une confirmation explicite (pas juste une ligne de chronique) — appel
- * d’allié résolu, etc. Sans `actions`, l’UI affiche un simple bouton OK.
+ * Notice générique, bloquante par défaut : modale mettant le jeu en pause
+ * tant qu’elle n’a pas été acquittée. Réutilisable pour n’importe quel
+ * évènement méritant une confirmation explicite (pas juste une ligne de
+ * chronique). Sans `actions`, l’UI affiche un simple bouton OK.
+ *
+ * `blocking: false` — notice informative empilable (ex. issue d’un appel à
+ * l’aide allié) : ne met pas le jeu en pause et s’affiche en pile avec les
+ * autres notices non bloquantes plutôt que de remplacer la précédente.
  */
 export interface GameNotice {
   id: number;
   title?: string;
   message: string;
   actions?: NoticeAction[];
+  blocking?: boolean;
 }
 
 export interface GameState {
@@ -168,11 +194,16 @@ export interface GameState {
   opinions: Record<string, number>;
   /** Cadeaux déjà envoyés : clé « fromId>towardId » */
   giftsSent: Record<string, true>;
+  /** Trêves actives après une guerre conclue : clé « min:max » → année de fin (pas de nouvelle guerre entre les deux avant). */
+  warTruces: Record<string, number>;
   /** Alliances actives (mariages / pactes). */
   alliances: Alliance[];
   /** Appels à l’aide en attente de réponse (guerre → allié sollicité). */
   allyCallRequests: AllyCallRequest[];
   nextAllyCallRequestId: number;
+  /** Demandes d’allégeance en attente de réponse (popup si la cible est le joueur). */
+  allegianceDemands: AllegianceDemand[];
+  nextAllegianceDemandId: number;
   /** File des notices modales en attente d’acquittement (première = affichée). */
   notices: GameNotice[];
   nextNoticeId: number;
@@ -236,13 +267,19 @@ export function pushLog(
 export function pushNotice(
   game: GameState,
   message: string,
-  opts?: { title?: string; actions?: NoticeAction[] },
+  opts?: { title?: string; actions?: NoticeAction[]; blocking?: boolean },
 ): void {
   if (!game.notices) game.notices = [];
   if (game.nextNoticeId == null) game.nextNoticeId = 1;
   game.notices = [
     ...game.notices,
-    { id: game.nextNoticeId++, title: opts?.title, message, actions: opts?.actions },
+    {
+      id: game.nextNoticeId++,
+      title: opts?.title,
+      message,
+      actions: opts?.actions,
+      blocking: opts?.blocking,
+    },
   ];
 }
 

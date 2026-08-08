@@ -96,9 +96,33 @@ function normalizeSlot(raw: unknown): SaveSlot | null {
   return null;
 }
 
+/**
+ * Filet de sécurité au chargement : une autosave dev écrite avant le fix de
+ * la course StrictMode sur la restauration (deux appels concurrents à
+ * `loadDevAutosave` pouvaient produire deux armées avec le même id — voir
+ * `useGame.ts`) reste corrompue une fois enregistrée telle quelle. Le fix ne
+ * répare pas rétroactivement une sauvegarde déjà écrite — donc dédoublonner
+ * ici à chaque chargement, plutôt que de compter sur l'utilisateur pour
+ * repartir d'une partie neuve.
+ */
+function repairArmies(game: GameState): void {
+  if (!game.armies?.length) return;
+  const seen = new Set<number>();
+  let maxId = 0;
+  const deduped = game.armies.filter((a) => {
+    if (a.id > maxId) maxId = a.id;
+    if (seen.has(a.id)) return false;
+    seen.add(a.id);
+    return true;
+  });
+  if (deduped.length !== game.armies.length) game.armies = deduped;
+  if ((game.nextArmyId ?? 1) <= maxId) game.nextArmyId = maxId + 1;
+}
+
 function describeSave(slot: SaveSlot): SaveInfo {
   const g = slot.game;
   if (!g.giftsSent) g.giftsSent = {};
+  if (!g.warTruces) g.warTruces = {};
   if (!g.alliances) g.alliances = [];
   if (!g.titles) {
     g.titles = buildInitialTitles(g.world);
@@ -111,6 +135,8 @@ function describeSave(slot: SaveSlot): SaveInfo {
   if (g.nextArmyId == null) g.nextArmyId = 1;
   if (!g.allyCallRequests) g.allyCallRequests = [];
   if (g.nextAllyCallRequestId == null) g.nextAllyCallRequestId = 1;
+  if (!g.allegianceDemands) g.allegianceDemands = [];
+  if (g.nextAllegianceDemandId == null) g.nextAllegianceDemandId = 1;
   // Notices modales : éphémères, ça n'a pas de sens de rouvrir une modale figée après rechargement.
   g.notices = [];
   if (g.nextNoticeId == null) g.nextNoticeId = 1;
@@ -134,10 +160,10 @@ function describeSave(slot: SaveSlot): SaveInfo {
 
 /** Snapshot jouable (pause forcée). */
 export function snapshotForSave(game: GameState): GameState {
-  return {
-    ...structuredClone(game),
-    playing: false,
-  };
+  // Idem saveDevAutosave : IndexedDB clone déjà en interne au put(), un
+  // structuredClone manuel ici double juste le travail. Copie superficielle
+  // suffisante pour ne pas muter `game.playing` par référence.
+  return { ...game, playing: false };
 }
 
 export async function saveGame(game: GameState): Promise<void> {
@@ -163,14 +189,18 @@ export async function loadGame(): Promise<GameState | null> {
     const slot = normalizeSlot(raw);
     if (!slot?.game?.world?.domaines || !slot.game.opinions) return null;
     if (!slot.game.giftsSent) slot.game.giftsSent = {};
+    if (!slot.game.warTruces) slot.game.warTruces = {};
     if (!slot.game.alliances) slot.game.alliances = [];
     if (slot.game.dayProgress == null) slot.game.dayProgress = 0;
     if (!slot.game.kingdomDrifts) slot.game.kingdomDrifts = [];
     if (slot.game.nextDriftId == null) slot.game.nextDriftId = 1;
     if (!slot.game.armies) slot.game.armies = [];
     if (slot.game.nextArmyId == null) slot.game.nextArmyId = 1;
+    repairArmies(slot.game);
     if (!slot.game.allyCallRequests) slot.game.allyCallRequests = [];
     if (slot.game.nextAllyCallRequestId == null) slot.game.nextAllyCallRequestId = 1;
+    if (!slot.game.allegianceDemands) slot.game.allegianceDemands = [];
+    if (slot.game.nextAllegianceDemandId == null) slot.game.nextAllegianceDemandId = 1;
     slot.game.notices = [];
     if (slot.game.nextNoticeId == null) slot.game.nextNoticeId = 1;
     // Anciennes sauvegardes (front automatique) : pas de migration fine possible —
@@ -228,10 +258,14 @@ export async function clearSave(): Promise<void> {
  * Jamais utilisé en build de prod.
  */
 export async function saveDevAutosave(game: GameState): Promise<void> {
+  // Pas de structuredClone manuel ici : IDBObjectStore.put() clone déjà la
+  // valeur en interne (obligatoire par la spec IndexedDB, exécuté de façon
+  // synchrone à l'appel) — cloner nous-mêmes avant faisait doubler le coût
+  // sur un état de jeu de plusieurs Mo, écrit ~1.7×/s en dev à vitesse 3×.
   const slot: SaveSlot = {
     version: 1,
     savedAt: Date.now(),
-    game: structuredClone(game),
+    game,
     worldFingerprint: worldFingerprint(game.world),
   };
   const db = await openDb();
@@ -258,6 +292,7 @@ export async function loadDevAutosave(expectedFingerprint: string): Promise<Game
     if (slot.worldFingerprint !== expectedFingerprint) return null;
     slot.game.notices = [];
     if (slot.game.nextNoticeId == null) slot.game.nextNoticeId = 1;
+    repairArmies(slot.game);
     return slot.game;
   } finally {
     db.close();

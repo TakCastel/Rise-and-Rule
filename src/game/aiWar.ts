@@ -57,14 +57,14 @@ function conductSide(
   if (!actor) return;
 
   if (role === "primary") {
-    const pressCheck = canPressDemands(war, actorId);
+    const pressCheck = canPressDemands(game, war, actorId);
     if (pressCheck.ok) {
       pressDemands(game, war.id, actorId);
       return;
     }
     // En difficulté et pas encore aidé : chercher du renfort allié avant de
     // continuer à se battre seul.
-    if (warScorePercent(war, actorId) < AI_CALL_ALLY_SCORE_THRESHOLD) {
+    if (warScorePercent(game, war, actorId) < AI_CALL_ALLY_SCORE_THRESHOLD) {
       const candidates = eligibleAlliesToCall(game, war, actorId);
       if (candidates.length && callAlly(game, war.id, candidates[0], actorId)) return;
     }

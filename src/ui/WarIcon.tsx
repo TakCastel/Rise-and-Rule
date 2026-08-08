@@ -74,7 +74,7 @@ export function WarIcon({
     <div className="war-icon-stack">
       {wars.map((w) => {
         const enemyName = w.attackerId === playerId ? w.defenderName : w.attackerName;
-        const score = warScorePercent(w, playerId!);
+        const score = warScorePercent(game, w, playerId!);
         const roundedScore = Math.max(-100, Math.min(100, Math.round(score)));
         const isBattling = game.armies.some((a) => a.warId === w.id && a.stance === "battling");
         return (

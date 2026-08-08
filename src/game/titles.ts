@@ -1,7 +1,47 @@
-import type { Possession, Province, WorldData } from "../types/world";
+import type { Domaine, Possession, Province, WorldData } from "../types/world";
+import { domainById } from "./army";
+import { seaLinkedDomainNeighbors } from "./war";
 
 function findPossession(world: WorldData, id: number): Possession | undefined {
   return (world.possessions || []).find((p) => p.id === id);
+}
+
+/**
+ * Domaines groupés par province / royaume, mis en cache par référence de
+ * `world.domaines` — évite de rescanner les ~700+ domaines à chaque province
+ * (`claimWarDomainIds` était appelée une fois par province dans
+ * `findProvinceWarGoal`, soit ~116 scans complets par évaluation de guerre IA).
+ */
+const domainsByProvinceCache = new WeakMap<Domaine[], Map<number, Domaine[]>>();
+function domainsByProvince(domaines: Domaine[]): Map<number, Domaine[]> {
+  let idx = domainsByProvinceCache.get(domaines);
+  if (!idx) {
+    idx = new Map();
+    for (const d of domaines) {
+      if (d.provinceId == null) continue;
+      const list = idx.get(d.provinceId);
+      if (list) list.push(d);
+      else idx.set(d.provinceId, [d]);
+    }
+    domainsByProvinceCache.set(domaines, idx);
+  }
+  return idx;
+}
+
+const domainsByRoyaumeCache = new WeakMap<Domaine[], Map<number, Domaine[]>>();
+function domainsByRoyaume(domaines: Domaine[]): Map<number, Domaine[]> {
+  let idx = domainsByRoyaumeCache.get(domaines);
+  if (!idx) {
+    idx = new Map();
+    for (const d of domaines) {
+      if (d.royaumeId == null) continue;
+      const list = idx.get(d.royaumeId);
+      if (list) list.push(d);
+      else idx.set(d.royaumeId, [d]);
+    }
+    domainsByRoyaumeCache.set(domaines, idx);
+  }
+  return idx;
 }
 
 function isUnderLiege(
@@ -192,7 +232,7 @@ export function provinceControl(
         .map((d) => d.id);
   const ownedDomainIds: number[] = [];
   for (const id of domainIds) {
-    const d = world.domaines.find((x) => x.id === id) ?? world.domaines[id];
+    const d = domainById(world, id);
     if (!d) continue;
     if (controlsDomain(world, possessionId, d.possessionId)) {
       ownedDomainIds.push(id);
@@ -275,7 +315,7 @@ export function kingdomControl(
         .map((d) => d.id);
   const ownedDomainIds: number[] = [];
   for (const id of domainIds) {
-    const d = world.domaines.find((x) => x.id === id) ?? world.domaines[id];
+    const d = domainById(world, id);
     if (!d) continue;
     if (controlsDomain(world, possessionId, d.possessionId)) {
       ownedDomainIds.push(id);
@@ -494,8 +534,7 @@ export function claimWarDomainIds(
   provinceId: number,
 ): number[] {
   const out: number[] = [];
-  for (const d of world.domaines) {
-    if (d.provinceId !== provinceId) continue;
+  for (const d of domainsByProvince(world.domaines).get(provinceId) || []) {
     if (!controlsDomain(world, defenderId, d.possessionId)) continue;
     if (controlsDomain(world, attackerId, d.possessionId)) continue;
     out.push(d.id);
@@ -511,8 +550,7 @@ export function claimWarDomainIdsInRoyaume(
   royaumeId: number,
 ): number[] {
   const out: number[] = [];
-  for (const d of world.domaines) {
-    if (d.royaumeId !== royaumeId) continue;
+  for (const d of domainsByRoyaume(world.domaines).get(royaumeId) || []) {
     if (!controlsDomain(world, defenderId, d.possessionId)) continue;
     if (controlsDomain(world, attackerId, d.possessionId)) continue;
     out.push(d.id);
@@ -862,11 +900,11 @@ export function isDomainAdjacentToRealm(
   actorId: number,
   domainId: number,
 ): boolean {
-  const domain =
-    world.domaines.find((d) => d.id === domainId) ?? world.domaines[domainId];
-  if (!domain) return false;
-  for (const nid of domain.neighbors || []) {
-    const n = world.domaines.find((d) => d.id === nid) ?? world.domaines[nid];
+  // Traverse la mer comme la guerre / l'alliance (courte traversée seulement,
+  // voir `seaLinkedDomainNeighbors`) — une revendication ne doit pas être
+  // plus restrictive que ce qu'on peut déjà attaquer ou avec qui s'allier.
+  for (const nid of seaLinkedDomainNeighbors(world, domainId)) {
+    const n = domainById(world, nid);
     if (!n) continue;
     if (controlsDomain(world, actorId, n.possessionId)) return true;
   }
@@ -887,7 +925,7 @@ export function findDomainWarGoal(
   const domainIds: number[] = [];
   const names: string[] = [];
   for (const id of claims) {
-    const d = world.domaines.find((x) => x.id === id) ?? world.domaines[id];
+    const d = domainById(world, id);
     if (!d) continue;
     if (!controlsDomain(world, defender.id, d.possessionId)) continue;
     if (controlsDomain(world, attacker.id, d.possessionId)) continue;
