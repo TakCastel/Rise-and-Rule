@@ -18,7 +18,7 @@ export function BuyMeACoffeeButton() {
       className="bmac-button"
       title="Buy me a coffee"
     >
-      <Coffee size={15} strokeWidth={2.25} aria-hidden />
+      <Coffee size={19} strokeWidth={2.25} aria-hidden />
       <span>Buy me a coffee</span>
     </a>
   );
