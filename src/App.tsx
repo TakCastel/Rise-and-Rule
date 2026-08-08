@@ -30,7 +30,7 @@ import { WarPanel } from "./ui/WarPanel";
 import { NoticeModal } from "./ui/NoticeModal";
 import { AllegianceDemandModal } from "./ui/AllegianceDemandModal";
 import { NoticeToastStack } from "./ui/NoticeToastStack";
-import { cn } from "@/lib/utils";
+import { cn, withBase } from "@/lib/utils";
 import "./App.css";
 
 const TERRAIN_ORDER: TerrainType[] = [
@@ -113,7 +113,7 @@ function App() {
   } = useGame(template);
 
   useEffect(() => {
-    fetch("/world.json")
+    fetch(withBase("/world.json"))
       .then((r) => r.json())
       .then((data: WorldData) => setTemplate(data));
   }, []);

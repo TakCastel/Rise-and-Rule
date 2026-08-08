@@ -1,3 +1,4 @@
+import { withBase } from "../lib/utils";
 import type { WorldData } from "../types/world";
 
 const KM_PER_DEG_LAT = 111.32;
@@ -97,7 +98,7 @@ export class Heightmap {
 
 export async function loadHeightmap(world: WorldData): Promise<Heightmap> {
   const meta = world.heightmap;
-  const res = await fetch(meta.url);
+  const res = await fetch(withBase(meta.url));
   const blob = await res.blob();
   const bitmap = await createImageBitmap(blob);
   const canvas = document.createElement("canvas");
